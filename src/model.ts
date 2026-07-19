@@ -78,6 +78,37 @@ export interface GuardianInfo {
     delegators_left: GuardianDelegator[];
 }
 
+/**
+ * Current Guardian state read directly from the contracts.
+ *
+ * Unlike {@link GuardianInfo}, this result intentionally contains no event-log
+ * history, actions or delegator list.
+ */
+export interface GuardianCurrent {
+    address: string;
+    block_number: number;
+    block_time: number;
+    details: GuardianCurrentDetails;
+    stake_status: GuardianStakeStatus;
+    reward_status: GuardianCurrentRewardStatus;
+}
+
+/** Guardian metadata needed by the visible detail header. */
+export interface GuardianCurrentDetails {
+    name: string;
+    website: string;
+    ip: string;
+    node_address: string;
+    details_URL: string;
+    registration_time: number;
+    last_update_time: number;
+}
+
+/** The Stake screen uses only the configured delegator reward share. */
+export interface GuardianCurrentRewardStatus {
+    delegator_reward_share: number;
+}
+
 export interface GuardianDetails {
     name: string;
     website: string;
@@ -161,6 +192,68 @@ export interface DelegatorInfo {
     stake_slices: DelegatorStake[];
     actions: Action[];
     reward_slices: DelegatorReward[];
+}
+
+/**
+ * Current Delegator state read directly from the contracts.
+ *
+ * Unlike {@link DelegatorInfo}, this result intentionally contains no
+ * event-log history or actions.
+ */
+export interface DelegatorCurrent {
+    address: string;
+    block_number: number;
+    block_time: number;
+    total_stake: number;
+    cooldown_stake: number;
+    current_cooldown_time: number;
+    non_stake: number;
+    delegated_to: string;
+}
+
+/** Inclusive block range represented by a history response. */
+export interface HistoryRange {
+    from_block: number;
+    to_block: number;
+    from_time?: number;
+    to_time?: number;
+}
+
+/** Describes which parts of a range-scoped history are exact. */
+export interface StakeHistoryDataQuality {
+    /** True only when every stake-domain value is exact for the entire range. */
+    exact: boolean;
+    /** Whether stake/cooldown values are exact for the entire range. */
+    stake_values_exact: boolean;
+    /** Whether the synthetic value at the start of the range is exact. */
+    anchor_exact: boolean;
+    /** How the synthetic value at the start of the range was obtained. */
+    anchor_source: 'current-state-reverse' | 'prior-event' | 'first-event' | 'chain-start' | 'current-flat' | 'first-event-backfill' | 'archive-state-call';
+    /** The data acquisition strategy used for this response. */
+    mode?: 'event-reconstruction' | 'sampled-state';
+    /** Whether requested timestamps were mapped to exact or estimated blocks. */
+    block_resolution?: 'exact' | 'linear-estimate-one-step-correction';
+    /** True when every historical stake value came from an archive eth_call. */
+    sampled_state?: boolean;
+    /** Guardian event logs do not contain an exact aggregate delegator count. */
+    n_delegates_available?: boolean;
+    notes?: string[];
+}
+
+/** Range-scoped Guardian stake history for lazy-loading chart data. */
+export interface GuardianStakeHistory {
+    address: string;
+    range: HistoryRange;
+    stake_slices: GuardianStake[];
+    data_quality: StakeHistoryDataQuality;
+}
+
+/** Range-scoped Delegator stake history for lazy-loading chart data. */
+export interface DelegatorStakeHistory {
+    address: string;
+    range: HistoryRange;
+    stake_slices: DelegatorStake[];
+    data_quality: StakeHistoryDataQuality;
 }
 
 export interface DelegatorStake {

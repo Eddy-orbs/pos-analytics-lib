@@ -12,6 +12,8 @@ import { bigToNumber, parseOptions } from './helpers';
 import { addressToTopic, appendItems, ascendingEvents, descendingEvents, Contracts, descendingBlockNumbers, generateTxLink, getBlockEstimatedTime, getQueryRewardsBlock, getStartOfRewardsBlock, getWeb3, readContractEvents, readDelegatorDataFromState, readGuardianDataFromState, Topics } from "./eth-helpers";
 import { Action, DelegatorReward, GuardianReward, PosOptions} from './model';
 
+const LEGACY_EVENT_QUERY = {loadHistoricalContractManifest: true};
+
 export async function getGuardianStakingRewards(address: string, ethereumEndpoint: string | any, options?: PosOptions | any): Promise<{rewardsAsGuardian: GuardianReward[];rewardsAsDelegator: DelegatorReward[];claimActions: Action[];}> {
     const web3 = _.isString(ethereumEndpoint) ? await getWeb3(ethereumEndpoint) : ethereumEndpoint;  
     const ethData = await readGuardianDataFromState(address, web3);
@@ -25,8 +27,8 @@ export async function getGuardianRewardsStakingInternal(address: string, ethStat
 
     // read events
     const txs: Promise<any>[] = [
-        readContractEvents([[Topics.GuardianRewardAssigned, Topics.DelegatorRewardAssigned, Topics.StakingRewardsClaimed], addressToTopic(stateData.gAddress)], Contracts.Reward, web3, stateData.startBlockNumber, stateData.endBlockNumber),
-        readContractEvents([Topics.StakingRewardAllocated], Contracts.Reward, web3, stateData.startBlockNumber, stateData.endBlockNumber)
+        readContractEvents([[Topics.GuardianRewardAssigned, Topics.DelegatorRewardAssigned, Topics.StakingRewardsClaimed], addressToTopic(stateData.gAddress)], Contracts.Reward, web3, stateData.startBlockNumber, stateData.endBlockNumber, LEGACY_EVENT_QUERY),
+        readContractEvents([Topics.StakingRewardAllocated], Contracts.Reward, web3, stateData.startBlockNumber, stateData.endBlockNumber, LEGACY_EVENT_QUERY)
     ];
     const res = await Promise.all(txs);
 
@@ -62,8 +64,8 @@ export async function getDelegatorRewardsStakingInternal(address: string, ethSta
 
     // read all events
     let txs: Promise<any>[] = [
-        readContractEvents([[Topics.DelegatorRewardAssigned, Topics.StakingRewardsClaimed], addressToTopic(address)], Contracts.Reward, web3, stateData.startBlockNumber, stateData.endBlockNumber),
-        readContractEvents([Topics.StakingRewardAllocated], Contracts.Reward, web3, stateData.startBlockNumber, stateData.endBlockNumber)
+        readContractEvents([[Topics.DelegatorRewardAssigned, Topics.StakingRewardsClaimed], addressToTopic(address)], Contracts.Reward, web3, stateData.startBlockNumber, stateData.endBlockNumber, LEGACY_EVENT_QUERY),
+        readContractEvents([Topics.StakingRewardAllocated], Contracts.Reward, web3, stateData.startBlockNumber, stateData.endBlockNumber, LEGACY_EVENT_QUERY)
     ];
     let res = await Promise.all(txs);
 
@@ -85,7 +87,7 @@ export async function getDelegatorRewardsStakingInternal(address: string, ethSta
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export async function getRewardsClaimActions(address: string, ethState:any, web3:any, options: PosOptions, isGuardian: boolean, refBlock?:{[chainId: number]: {time: number, number: number}}): Promise<{claimActions: Action[]}> {
     const startBlock = getQueryRewardsBlock(options.read_from_block, ethState.block.number)
-    const events = await readContractEvents([Topics.StakingRewardsClaimed, addressToTopic(address)], Contracts.Reward, web3, startBlock);
+    const events = await readContractEvents([Topics.StakingRewardsClaimed, addressToTopic(address)], Contracts.Reward, web3, startBlock, 'latest', LEGACY_EVENT_QUERY);
     const chainId = await web3.eth.getChainId();
     return {claimActions: filterClaimActions(events, isGuardian, chainId, refBlock)};
 }
@@ -156,7 +158,7 @@ function generateClaimAction(event:any, isGuardian:boolean, chainId: number, ref
 async function generateAllDelegatorGuardiansEvents(guardians:DelegatorGuardianTransitions[], web3:any) {
     const txs = []; 
     for (const guardian of guardians) {
-        txs.push(readContractEvents([Topics.GuardianRewardAssigned, addressToTopic(guardian.guardianAddress)], Contracts.Reward, web3, guardian.from, guardian.to))
+        txs.push(readContractEvents([Topics.GuardianRewardAssigned, addressToTopic(guardian.guardianAddress)], Contracts.Reward, web3, guardian.from, guardian.to, LEGACY_EVENT_QUERY))
     }
     const res = await Promise.all(txs);
     

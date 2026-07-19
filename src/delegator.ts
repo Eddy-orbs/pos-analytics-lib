@@ -9,9 +9,35 @@
 import _ from 'lodash';
 import BigNumber from "bignumber.js";
 import { bigToNumber, optionsStartFromText, parseOptions } from './helpers';
-import { addressToTopic, appendItems, ascendingEvents, Contracts, generateTxLink, getBlockEstimatedTime, getQueryDelegationBlock, getQueryPosBlock, getStartOfPosBlock, getWeb3, getWeb3Polygon, readContractEvents, readDelegatorDataFromState, Topics } from "./eth-helpers";
-import { DelegatorInfo, DelegatorAction, DelegatorReward, DelegatorStake, PosOptions } from "./model";
+import { addressToTopic, appendItems, ascendingEvents, Contracts, generateTxLink, getBlockEstimatedTime, getQueryDelegationBlock, getQueryPosBlock, getStartOfPosBlock, getWeb3, getWeb3Polygon, readContractEvents, readDelegatorCurrentDataFromState, readDelegatorDataFromState, Topics } from "./eth-helpers";
+import { DelegatorCurrent, DelegatorInfo, DelegatorAction, DelegatorReward, DelegatorStake, PosOptions } from "./model";
 import { getDelegatorRewardsStakingInternal, getRewardsClaimActions } from './rewards';
+
+const LEGACY_EVENT_QUERY = {loadHistoricalContractManifest: true};
+
+/**
+ * Reads only the Delegator's current contract state.
+ *
+ * This does not query event logs and therefore does not load actions, stake
+ * history or reward history. A string endpoint creates an Ethereum Web3
+ * instance; callers querying Polygon should pass a configured Polygon Web3
+ * instance.
+ */
+export async function getDelegatorCurrent(address: string, endpointOrWeb3: string | any): Promise<DelegatorCurrent> {
+    const web3 = _.isString(endpointOrWeb3) ? await getWeb3(endpointOrWeb3) : endpointOrWeb3;
+    const ethData = await readDelegatorCurrentDataFromState(address, web3);
+
+    return {
+        address: address.toLowerCase(),
+        block_number: ethData.block.number,
+        block_time: ethData.block.time,
+        total_stake: bigToNumber(ethData.staked),
+        cooldown_stake: bigToNumber(ethData.cooldown_stake),
+        current_cooldown_time: ethData.current_cooldown_time,
+        non_stake: bigToNumber(ethData.non_stake),
+        delegated_to: ethData.guardian,
+    };
+}
 
 export async function getDelegator(address: string, ethereumEndpoint: string | any, o?: PosOptions | any, refBlock?:{[chainId: number]: {time: number, number: number}}): Promise<DelegatorInfo> {
     const options = parseOptions(o);
@@ -65,7 +91,7 @@ export async function getDelegator(address: string, ethereumEndpoint: string | a
 async function getStakeActions(address:string, ethState:any, web3:any, options: PosOptions, refBlock?:{[chainId: number]: {time: number, number: number}}) {
     let startBlock = getQueryPosBlock(options.read_from_block, ethState.block.number);
     const filter = [undefined /*don't filter event type*/, addressToTopic(address)];
-    const events = await readContractEvents(filter, Contracts.Stake, web3, startBlock);
+    const events = await readContractEvents(filter, Contracts.Stake, web3, startBlock, 'latest', LEGACY_EVENT_QUERY);
     const chainId = await web3.eth.getChainId();
 
     let totalStake = new BigNumber(0);
@@ -126,7 +152,7 @@ function generateStakeAction(block_number: number, block_time: number, stake: nu
 async function getDelegateActions(address:string, ethState:any, web3:any, options: PosOptions, refBlock?:{[chainId: number]: {time: number, number: number}}) {
     let startBlock = getQueryDelegationBlock(options.read_from_block, ethState.block.number);
     const filter = [Topics.Delegated, addressToTopic(address)];
-    const events = await readContractEvents(filter, Contracts.Delegate, web3, startBlock);
+    const events = await readContractEvents(filter, Contracts.Delegate, web3, startBlock, 'latest', LEGACY_EVENT_QUERY);
     const chainId = await web3.eth.getChainId();
 
     const delegateActions: DelegatorAction[] = [];

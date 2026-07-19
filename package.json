@@ -28,7 +28,9 @@
     "build": "tsc --skipLibCheck -p ./tsconfig.prod.json",
     "prepare": "npm run build",
     "pretest": "npm run clean && tsc --skipLibCheck",
-    "test": "node -r esm --async-stack-traces ./dist/trial.test.js",
+    "test": "node --async-stack-traces ./dist/query/event-reader.test.js && node --async-stack-traces ./dist/query/event-cache.test.js && node --async-stack-traces ./dist/query/block-time.test.js && node --async-stack-traces ./dist/history/stake-history.test.js && node --async-stack-traces ./dist/guardian-delegators-page.test.js",
+    "test:query": "npm run clean && tsc --skipLibCheck && node --async-stack-traces ./dist/query/event-reader.test.js",
+    "test:integration": "npm run clean && tsc --skipLibCheck && node --async-stack-traces ./dist/trial.test.js",
     "release": "release-it"
   },
   "devDependencies": {

@@ -11,6 +11,8 @@ import { Contracts, getBlockEstimatedTime, getStartOfDelegationBlock, getWeb3, r
 import { fetchJson } from './helpers';
 import { PosOverview, PosOverviewSlice, PosOverviewData, Delegator } from './model';
 
+const LEGACY_EVENT_QUERY = {loadHistoricalContractManifest: true};
+
 export async function getOverview(networkNodeUrls: string[], ethereumEndpoint: string): Promise<PosOverview> {
     let fullError = ''; 
     for(const url of networkNodeUrls) {
@@ -27,7 +29,14 @@ export async function getOverview(networkNodeUrls: string[], ethereumEndpoint: s
 
 export async function getAllDelegators(ethereumEndpoint: string) {
     const web3 = _.isString(ethereumEndpoint) ? await getWeb3(ethereumEndpoint) : ethereumEndpoint;
-    const events = await readContractEvents([Topics.Delegated], Contracts.Delegate, web3, getStartOfDelegationBlock().number);
+    const events = await readContractEvents(
+        [Topics.Delegated],
+        Contracts.Delegate,
+        web3,
+        getStartOfDelegationBlock().number,
+        'latest',
+        LEGACY_EVENT_QUERY
+    );
     const chainId = await web3.eth.getChainId();
 
     const delegatorMap: {[key:string]: Delegator} = {};

@@ -104,6 +104,44 @@ Function's input is an Ethereum endpoint.
 const delegatorMap = await getAllDelegators(ethereumEndpoint);
 ```
 
+### Load-aware detail APIs
+
+New applications should compose detail screens from the smaller APIs below instead of calling the legacy
+`getGuardian` / `getDelegator` aggregate functions on page entry.
+
+* `getGuardianCurrent(address, web3)` and `getDelegatorCurrent(address, web3)` read current contract state only.
+  They do not query event logs.
+* `getGuardianStakeHistory` and `getDelegatorStakeHistory` use bounded archive state sampling when
+  `sample_timestamps` is supplied. This issues no event-log query and reads only the chart's selected points.
+  The range-scoped event reconstruction mode remains available when `sample_timestamps` is omitted.
+* `resolveBlockAtOrAfterTimestamp(web3, unixTimestamp)` resolves a time-window boundary with a bounded block
+  timestamp binary search.
+* `getGuardianDelegatorsPage(address, web3, {page_size, cursor})` loads the delegator list only when requested.
+  It seeds from a block-pinned Subgraph snapshot, replays only the short RPC delta, and hydrates balances only for
+  the returned page. Ethereum uses materialized entities; Polygon adapts its legacy absolute-event schema.
+  A full-chain RPC fallback is disabled unless `allow_full_rpc_fallback: true` is explicitly supplied.
+
+Web3 initialization resolves current contracts through bounded registry `eth_call` hops and performs no registry
+event scan. Legacy aggregate and event-reconstruction calls lazily rebuild the historical contract manifest from
+Registry events once per Web3 instance; current-state, sampled-history and Guardian-page delta calls never trigger
+that full Registry replay. Event-mode reads use an inclusive adaptive engine: provider range-limit errors split the block range,
+HTTP 429 responses use pacing/backoff and ultimately split, transient failures are retried, and completed immutable
+ranges are cached by finality policy. Sampled-state reads use paced archive `eth_call` with bounded retry and never
+fall back to an unbounded log scan. Every history response includes `data_quality`; consumers must hide a metric
+when its availability flag is false.
+
+```ts
+const current = await getGuardianCurrent(address, web3);
+const fromBlock = await resolveBlockAtOrAfterTimestamp(web3, twelveMonthsAgo);
+const history = await getGuardianStakeHistory(address, web3, {
+  from_block: fromBlock,
+  sample_timestamps: utcBucketBoundaries,
+  current_snapshot: current,
+  state_call_interval_ms: 350
+});
+const firstPage = await getGuardianDelegatorsPage(address, web3, {page_size: 50});
+```
+
 ### Helper Functions
 
 * delegatorToXlsx
@@ -191,13 +229,14 @@ npm run clean
 ```
 
 ### Test
-There is only an "E2E" like test that calls all functions of the library, to run it you must setup an Ethereum-Endpoint for web3 http provider. This can be done by setting an enviroment variable in your running IDEA named `ETHEREUM_ENDPOINT`, or adding a file named `.env` at the root of the directory and in that file have one line `ETHEREUM_ENDPOINT=https://mainnet.infura.io/v3/<YOUR-INFURA-KEY>`
-
-Then you can run the test
+The default suite is deterministic and does not require a live RPC endpoint:
 
 ```
 npm run test
 ```
 
-The results will be in a direcotry `data` under root direcotry of the project. You will see 4 json files, one for each function call.
+The legacy live integration test remains available separately. Set `ETHEREUM_ENDPOINT` and run:
 
+```
+npm run test:integration
+```

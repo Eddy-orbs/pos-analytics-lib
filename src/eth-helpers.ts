@@ -20,6 +20,7 @@ import { rewardsAbi } from './abis/rewards';
 import { feeBootstrapRewardAbi } from './abis/feebootstrap';
 import { bigToNumber, DECIMALS, getIpFromHex } from './helpers';
 import { registryAbi } from './abis/registry';
+import { deduplicateEvents, EventQueryOptions, readEventRange } from './query/event-reader';
 
 export enum Topics {
     Staked = '0x1449c6dd7851abc30abf37f57715f492010519147cc2652fbc38202c18a6ee90',
@@ -55,14 +56,14 @@ export enum Contracts {
     Registry = 'ContractRegistry'
 }
 
-interface ContractValidData {
+export interface ContractValidData {
     address: string;
     startBlock: number;
     endBlock: number | string;
     abi: any;
 }
 
-interface ContractsData {[key:string]: ContractValidData[]};
+export interface ContractsData {[key:string]: ContractValidData[]};
 
 const maxPace = 4000000;
 
@@ -83,7 +84,7 @@ export async function getWeb3(ethereumEndpoint: string, readContracts:boolean = 
     contractsData[Contracts.Registry] = [{address: '0xD859701C81119aB12A1e62AF6270aD2AE05c7AB3', startBlock: 11191400, endBlock: 'latest', abi: registryAbi /*getAbiByContractName(Contracts.Registry)*/ }];
     
     if (readContracts) {
-        await readContractsAddresses(contractsData, web3)
+        await readCurrentContractsAddresses(contractsData, web3, 1);
         Object.assign(web3, {contractsData});
     }
 
@@ -107,24 +108,197 @@ export async function getWeb3Polygon(ethereumEndpoint: string, readContracts:boo
     contractsData[Contracts.Registry] = [{address: '0x35eA0D75b2a3aB06393749B4651DfAD1Ffd49A77', startBlock: 25502848, endBlock: 'latest', abi: registryAbi /*getAbiByContractName(Contracts.Registry)*/ }];
 
     if (readContracts) {
-        await readContractsAddresses(contractsData, web3)
+        await readCurrentContractsAddresses(contractsData, web3, 137);
         Object.assign(web3, {contractsData});
     }
 
     return web3;
 }
 
-async function readContractsAddresses(contractsData: ContractsData, web3:any) {
+const MAX_CURRENT_REGISTRY_HOPS = 16;
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+const HISTORICAL_CONTRACT_TYPES = [
+    Contracts.Delegate,
+    Contracts.Reward,
+    Contracts.FeeBootstrapReward,
+    Contracts.Guardian
+];
+
+interface HistoricalContractManifestState {
+    seed: ContractValidData;
+    loaded: boolean;
+    promise?: Promise<void>;
+}
+
+function copyContractData(contract: ContractValidData): ContractValidData {
+    return {
+        address: contract.address,
+        startBlock: contract.startBlock,
+        endBlock: contract.endBlock,
+        abi: contract.abi
+    };
+}
+
+function historicalManifestState(web3: any, seed?: ContractValidData): HistoricalContractManifestState {
+    if (!web3.__posAnalyticsHistoricalContractManifest) {
+        if (!seed) throw new Error('Missing initial ContractRegistry seed for historical manifest');
+        web3.__posAnalyticsHistoricalContractManifest = {
+            seed: copyContractData(seed),
+            loaded: false
+        } as HistoricalContractManifestState;
+    }
+    return web3.__posAnalyticsHistoricalContractManifest;
+}
+
+function normalizedContractAddress(address: any, description: string): string {
+    const normalized = String(address || '').toLowerCase();
+    if (!/^0x[0-9a-f]{40}$/.test(normalized) || normalized === ZERO_ADDRESS) {
+        throw new Error(`Invalid ${description} address: ${String(address)}`);
+    }
+    return normalized;
+}
+
+/**
+ * Resolve only the contracts used for current state reads. Registry migrations
+ * are followed with eth_call; startup deliberately performs no eth_getLogs.
+ */
+export async function readCurrentContractsAddresses(
+    contractsData: ContractsData,
+    web3: any,
+    chainId: number,
+    maxRegistryHops: number = MAX_CURRENT_REGISTRY_HOPS
+): Promise<ContractsData> {
+    const initialRegistry = contractsData[Contracts.Registry] && contractsData[Contracts.Registry][0];
+    if (!initialRegistry) throw new Error('Missing initial ContractRegistry configuration');
+    historicalManifestState(web3, initialRegistry);
+    const boundedHops = Math.max(1, Math.floor(maxRegistryHops));
+    let registryAddress = normalizedContractAddress(initialRegistry.address, 'registry');
+    let delegateAddress = '';
+    const visited: {[address: string]: boolean} = Object.create(null);
+
+    for (let hop = 0; hop < boundedHops; hop += 1) {
+        if (visited[registryAddress]) {
+            throw new Error(`ContractRegistry migration loop detected at ${registryAddress}`);
+        }
+        visited[registryAddress] = true;
+        const registry = new web3.eth.Contract(registryAbi, registryAddress);
+        delegateAddress = normalizedContractAddress(
+            await registry.methods.getContract(Contracts.Delegate).call(),
+            Contracts.Delegate
+        );
+        const delegation = new web3.eth.Contract(delegationAbi, delegateAddress);
+        const delegationRegistry = normalizedContractAddress(
+            await delegation.methods.getContractRegistry().call(),
+            'delegation registry'
+        );
+        if (delegationRegistry === registryAddress) break;
+        registryAddress = delegationRegistry;
+        delegateAddress = '';
+    }
+
+    if (!delegateAddress) {
+        throw new Error(`Unable to resolve current ContractRegistry within ${boundedHops} hops`);
+    }
+
+    const currentRegistry = new web3.eth.Contract(registryAbi, registryAddress);
+    const currentAddresses = await Promise.all([
+        Promise.resolve(delegateAddress),
+        currentRegistry.methods.getContract(Contracts.Reward).call(),
+        currentRegistry.methods.getContract(Contracts.FeeBootstrapReward).call(),
+        currentRegistry.methods.getContract(Contracts.Guardian).call()
+    ]);
+    const currentTypes = [Contracts.Delegate, Contracts.Reward, Contracts.FeeBootstrapReward, Contracts.Guardian];
+    const startBlock = getStartOfPosBlock(chainId).number;
+    currentTypes.forEach((contractType, index) => {
+        const address = normalizedContractAddress(currentAddresses[index], contractType);
+        contractsData[contractType] = [{
+            address,
+            startBlock,
+            endBlock: 'latest',
+            abi: getAbiForContract(address, contractType)
+        }];
+    });
+    contractsData[Contracts.Registry] = [{
+        address: registryAddress,
+        startBlock,
+        endBlock: 'latest',
+        abi: registryAbi
+    }];
+    return contractsData;
+}
+
+/**
+ * Legacy compatibility loader. The expensive Registry event replay is opt-in,
+ * shared by concurrent callers and committed atomically only after success.
+ */
+export async function ensureHistoricalContracts(
+    web3: any,
+    queryOptions: EventQueryOptions = {}
+): Promise<void> {
+    const currentData: ContractsData = web3 && web3.contractsData;
+    if (!currentData) throw new Error('Web3 contractsData is not initialized');
+    const currentRegistry = currentData[Contracts.Registry] && currentData[Contracts.Registry][0];
+    const state = historicalManifestState(web3, currentRegistry);
+    if (state.loaded) return;
+    if (state.promise) return state.promise;
+
+    const loadOptions = Object.assign({}, queryOptions, {loadHistoricalContractManifest: false});
+    const operation = (async () => {
+        const historicalData: ContractsData = {};
+        historicalData[Contracts.Erc20] = (currentData[Contracts.Erc20] || []).map(copyContractData);
+        historicalData[Contracts.Stake] = (currentData[Contracts.Stake] || []).map(copyContractData);
+        historicalData[Contracts.Registry] = [copyContractData(state.seed)];
+        for (const contractType of HISTORICAL_CONTRACT_TYPES) historicalData[contractType] = [];
+
+        await readContractsAddresses(historicalData, web3, loadOptions);
+        for (const contractType of HISTORICAL_CONTRACT_TYPES) {
+            const historical = historicalData[contractType];
+            const current = currentData[contractType] && currentData[contractType][currentData[contractType].length - 1];
+            if (!current || historical.length === 0) {
+                throw new Error(`Historical Registry manifest is missing ${contractType}`);
+            }
+            const resolvedCurrent = historical[historical.length - 1];
+            if (resolvedCurrent.address.toLowerCase() !== current.address.toLowerCase()) {
+                throw new Error(`Historical Registry manifest current ${contractType} address does not match current state`);
+            }
+            resolvedCurrent.endBlock = 'latest';
+        }
+        for (const contractType of HISTORICAL_CONTRACT_TYPES) {
+            currentData[contractType] = historicalData[contractType];
+        }
+    })();
+    state.promise = operation.then(() => {
+        state.loaded = true;
+        state.promise = undefined;
+    }, error => {
+        state.promise = undefined;
+        throw error;
+    });
+    return state.promise;
+}
+
+async function readContractsAddresses(
+    contractsData: ContractsData,
+    web3: any,
+    queryOptions?: EventQueryOptions
+) {
     let currentStartBlock = contractsData[Contracts.Registry][0].startBlock;
     let currentRegAddress = contractsData[Contracts.Registry][0].address;
+    const visited: {[address: string]: boolean} = Object.create(null);
 
-    do {
+    for (let hop = 0; hop < MAX_CURRENT_REGISTRY_HOPS && currentRegAddress !== ''; hop += 1) {
+        const normalizedRegistry = normalizedContractAddress(currentRegAddress, 'historical registry');
+        if (visited[normalizedRegistry]) throw new Error(`Historical ContractRegistry migration loop detected at ${normalizedRegistry}`);
+        visited[normalizedRegistry] = true;
         const currentRegContract = new web3.eth.Contract(contractsData[Contracts.Registry][0].abi, currentRegAddress);
-        const res = await readRegisteryEvents(contractsData, currentRegContract, currentStartBlock);
+        const res = await readRegisteryEvents(contractsData, currentRegContract, currentStartBlock, web3, queryOptions);
         currentRegAddress = res.nextRegContract;
         currentStartBlock = res.nextRegStartBlock;
         // we don't update the registry as this is one time use only (at the moment)
-    } while (currentRegAddress !== '');
+    }
+    if (currentRegAddress !== '') {
+        throw new Error(`Unable to load historical ContractRegistry manifest within ${MAX_CURRENT_REGISTRY_HOPS} hops`);
+    }
     return contractsData;
 }
 
@@ -263,6 +437,57 @@ export async function readOverviewDataFromState(web3:any) {
 
 const balance = 'b', staked = 's', cooldownStake = 'cooldownStake', cooldownTime = 'cooldownTime';
 const dRewardBalance = 'dRewardBalance', dRewardClaim = 'dRewardClaim', dGuardian = 'dGuardian', dRPT = 'dRPT', dDeltaRPT = 'dDeltaRPT';
+
+/**
+ * Minimal Delegator state for the visible Stake screen. This deliberately
+ * excludes every reward-state call and performs a single multicall RPC.
+ */
+export async function readDelegatorCurrentDataFromState(address:string, web3:any) {
+    const config = {web3, multicallAddress: web3.multicallContractAddress};
+    const erc20Address = getLatestPosContractAddress(web3, Contracts.Erc20);
+    const stakeAddress = getLatestPosContractAddress(web3, Contracts.Stake);
+    const delegateAddress = getLatestPosContractAddress(web3, Contracts.Delegate);
+    const calls: any[] = [
+        {
+            target: erc20Address,
+            call: ['balanceOf(address)(uint256)', address],
+            returns: [[balance, (v: BigNumber.Value) => new BigNumber(v)]]
+        },
+        {
+            target: stakeAddress,
+            call: ['getStakeBalanceOf(address)(uint256)', address],
+            returns: [[staked, (v: BigNumber.Value) => new BigNumber(v)]]
+        },
+        {
+            target: stakeAddress,
+            call: ['getUnstakeStatus(address)(uint256,uint256)', address],
+            returns: [
+                [cooldownStake, (v: BigNumber.Value) => new BigNumber(v)],
+                [cooldownTime, (v: BigNumber.Value) => new BigNumber(v)]
+            ]
+        },
+        {
+            target: delegateAddress,
+            call: ['getDelegation(address)(address)', address],
+            returns: [[dGuardian, (v: string) => v.toLowerCase()]]
+        },
+        {
+            call: ['getCurrentBlockTimestamp()(uint256)'],
+            returns: [[CURRENT_BLOCK_TIMESTAMP]]
+        }
+    ];
+    const result = await aggregate(calls, config);
+    const data = result.results.transformed;
+    return {
+        block: multicallToBlockInfo(result),
+        non_stake: data[balance],
+        staked: data[staked],
+        cooldown_stake: data[cooldownStake],
+        current_cooldown_time: data[cooldownTime].toNumber(),
+        guardian: data[dGuardian]
+    };
+}
+
 // Function depends on version 0.11.0 of makderdao/multicall only on 'latest' block
 async function readDelegatorState(address:string, web3:any) {
     const config = { web3, multicallAddress: web3.multicallContractAddress};
@@ -336,6 +561,95 @@ export async function readDelegatorDataFromState(address:string, web3:any) {
 const gIp = 'ip', gName = 'name', gWebsite = 'website', gOrbsAddr = 'orbsaddress', gRegTime = 'gRegTime', gUpdateTime = 'gUpdateTime', gUrl = 'gUrl', gDelegateStake = 'gDelegateStake';
 const gRewardBalance = 'gRewardBalance', gRewardClaim = 'gRewardClaim', gLastRewardBalance = 'gLastRewardBalance', gLastRewardClaim = 'gLastRewardClaim', gRPW = 'gRPW', gDeltaRPW = 'gDeltaRPW', gRPT = 'gRPT', gDeltaRPT = 'gDeltaRPT', gRewardPrecent = 'gRewardPrecent';
 const gFeeBalance = 'gFeeBalance', gFeeWithdraw = 'gFeeWithdraw', gBootBalance = 'gBootBalance', gBootWithdraw = 'gBootWithdraw', gCertified = 'gCertified';
+
+/**
+ * Minimal Guardian state for the visible header and Stake screen. Reward
+ * balances, fees, bootstrap rewards and hidden action data are not queried.
+ */
+export async function readGuardianCurrentDataFromState(address:string, web3:any) {
+    const config = {web3, multicallAddress: web3.multicallContractAddress};
+    const erc20Address = getLatestPosContractAddress(web3, Contracts.Erc20);
+    const stakeAddress = getLatestPosContractAddress(web3, Contracts.Stake);
+    const rewardAddress = getLatestPosContractAddress(web3, Contracts.Reward);
+    const guardianContractAddress = getLatestPosContractAddress(web3, Contracts.Guardian);
+    const delegateAddress = getLatestPosContractAddress(web3, Contracts.Delegate);
+    const calls: any[] = [
+        {
+            target: erc20Address,
+            call: ['balanceOf(address)(uint256)', address],
+            returns: [[balance, (v: BigNumber.Value) => new BigNumber(v)]]
+        },
+        {
+            target: stakeAddress,
+            call: ['getStakeBalanceOf(address)(uint256)', address],
+            returns: [[staked, (v: BigNumber.Value) => new BigNumber(v)]]
+        },
+        {
+            target: stakeAddress,
+            call: ['getUnstakeStatus(address)(uint256,uint256)', address],
+            returns: [
+                [cooldownStake, (v: BigNumber.Value) => new BigNumber(v)],
+                [cooldownTime, (v: BigNumber.Value) => new BigNumber(v)]
+            ]
+        },
+        {
+            target: rewardAddress,
+            call: ['getGuardianDelegatorsStakingRewardsPercentMille(address)(uint256)', address],
+            returns: [[gRewardPrecent, (v: BigNumber.Value) => new BigNumber(v)]]
+        },
+        {
+            target: delegateAddress,
+            call: ['getDelegatedStake(address)(uint256)', address],
+            returns: [[gDelegateStake, (v: BigNumber.Value) => new BigNumber(v)]]
+        },
+        {
+            target: guardianContractAddress,
+            call: ['getMetadata(address,string)(string)', address, 'ID_FORM_URL'],
+            returns: [[gUrl]]
+        },
+        {
+            target: guardianContractAddress,
+            call: ['getGuardianData(address)(bytes4,address,string,string,uint,uint)', address],
+            returns: [
+                [gIp, (v: string) => getIpFromHex(v)],
+                [gOrbsAddr, (v: string) => v.toLowerCase()],
+                [gName], [gWebsite],
+                [gRegTime, (v: BigNumber.Value) => new BigNumber(v)],
+                [gUpdateTime, (v: BigNumber.Value) => new BigNumber(v)]
+            ]
+        },
+        {
+            call: ['getCurrentBlockTimestamp()(uint256)'],
+            returns: [[CURRENT_BLOCK_TIMESTAMP]]
+        }
+    ];
+    const result = await aggregate(calls, config);
+    const data = result.results.transformed;
+    return {
+        block: multicallToBlockInfo(result),
+        details: {
+            name: data[gName],
+            website: data[gWebsite],
+            ip: data[gIp],
+            node_address: data[gOrbsAddr],
+            registration_time: data[gRegTime].toNumber(),
+            last_update_time: data[gUpdateTime].toNumber(),
+            details_URL: data[gUrl]
+        },
+        stake_status: {
+            self_stake: bigToNumber(data[staked]),
+            cooldown_stake: bigToNumber(data[cooldownStake]),
+            current_cooldown_time: data[cooldownTime].toNumber(),
+            non_stake: bigToNumber(data[balance]),
+            delegated_stake: bigToNumber(data[gDelegateStake].minus(data[staked])),
+            total_stake: bigToNumber(data[gDelegateStake])
+        },
+        reward_status: {
+            delegator_reward_share: data[gRewardPrecent].toNumber() / 100000
+        }
+    };
+}
+
 // Function depends on version 0.11.0 of makderdao/multicall only on 'latest' block
 async function readGuardianState(address:string, web3:any) {
     const config = { web3, multicallAddress: web3.multicallContractAddress};
@@ -507,50 +821,210 @@ export function appendItems<T>(target: T[], items: T[]) {
     }
 }
 
-export async function readContractEvents(filter: (string[] | string | undefined)[], contractsType:Contracts, web3:Web3, fromBlock?:number, toBlock:number|string = 'latest') {
+function configuredEventQueryOptions(web3: any, overrides?: EventQueryOptions): EventQueryOptions {
+    return Object.assign({}, web3 && web3.eventQueryOptions ? web3.eventQueryOptions : {}, overrides || {});
+}
+
+interface CachedEventCoverage {
+    fromBlock: number;
+    toBlock: number;
+}
+
+interface EventRangeCacheEntry {
+    coverage: CachedEventCoverage[];
+    events: any[];
+}
+
+const DEFAULT_EVENT_CACHE_FINALITY: {[chainId: string]: number} = {
+    1: 64,
+    137: 256
+};
+
+function eventCacheHost(web3: any): {[key: string]: EventRangeCacheEntry} {
+    if (!web3.__posAnalyticsEventRangeCache) {
+        web3.__posAnalyticsEventRangeCache = Object.create(null);
+    }
+    return web3.__posAnalyticsEventRangeCache;
+}
+
+function eventCacheKey(contract: any, filter: (string[] | string | undefined)[]): string | undefined {
+    const address = contract && contract.options && contract.options.address;
+    if (!address) return undefined;
+    return `${String(address).toLowerCase()}:${JSON.stringify(filter)}`;
+}
+
+function normalizeCoverage(ranges: CachedEventCoverage[]): CachedEventCoverage[] {
+    const sorted = ranges.slice().sort((a, b) => a.fromBlock - b.fromBlock || a.toBlock - b.toBlock);
+    const result: CachedEventCoverage[] = [];
+    for (const range of sorted) {
+        const previous = result[result.length - 1];
+        if (!previous || range.fromBlock > previous.toBlock + 1) {
+            result.push({fromBlock: range.fromBlock, toBlock: range.toBlock});
+        } else {
+            previous.toBlock = Math.max(previous.toBlock, range.toBlock);
+        }
+    }
+    return result;
+}
+
+function missingCoverage(fromBlock: number, toBlock: number, coverage: CachedEventCoverage[]): CachedEventCoverage[] {
+    if (fromBlock > toBlock) return [];
+    const missing: CachedEventCoverage[] = [];
+    let cursor = fromBlock;
+    for (const range of normalizeCoverage(coverage)) {
+        if (range.toBlock < cursor || range.fromBlock > toBlock) continue;
+        if (range.fromBlock > cursor) {
+            missing.push({fromBlock: cursor, toBlock: Math.min(toBlock, range.fromBlock - 1)});
+        }
+        cursor = Math.max(cursor, range.toBlock + 1);
+        if (cursor > toBlock) break;
+    }
+    if (cursor <= toBlock) missing.push({fromBlock: cursor, toBlock});
+    return missing;
+}
+
+function eventsWithin(events: any[], fromBlock: number, toBlock: number): any[] {
+    return events.filter(event => {
+        const block = Number(event && event.blockNumber);
+        return isFinite(block) && block >= fromBlock && block <= toBlock;
+    });
+}
+
+async function numericEndBlock(endBlock: number | string, web3: any): Promise<number> {
+    if (typeof endBlock === 'number') return Math.floor(endBlock);
+    if (endBlock !== 'latest') throw new Error(`Unsupported event query end block: ${endBlock}`);
+    if (web3.eth.getBlockNumber) return Number(await web3.eth.getBlockNumber());
+    const latest = await web3.eth.getBlock('latest');
+    return Number(latest.number);
+}
+
+export async function readContractEvents(
+    filter: (string[] | string | undefined)[],
+    contractsType: Contracts,
+    web3: Web3,
+    fromBlock?: number,
+    toBlock: number | string = 'latest',
+    queryOptions?: EventQueryOptions
+) {
+    const effectiveOptions = configuredEventQueryOptions(web3, queryOptions);
+    if (effectiveOptions.loadHistoricalContractManifest) {
+        await ensureHistoricalContracts(web3, effectiveOptions);
+    }
     if (!fromBlock) {
         const chainId = await web3.eth.getChainId();
         fromBlock = getStartOfPosBlock(chainId).number;
     }
-    const contracts = getPosContracts(web3, contractsType);
+    const requestedEnd = await numericEndBlock(toBlock, web3);
+    const contractsData: ContractValidData[] = (web3 as any).contractsData[contractsType] || [];
     const allEvents: any[] = [];
-    for(const contract of contracts) {
-        const events = await readEvents(filter, contract, web3, fromBlock, toBlock, maxPace);
-        appendItems(allEvents, events);
+    for (const contractData of contractsData) {
+        const deploymentEnd = contractData.endBlock === 'latest' ? requestedEnd : Number(contractData.endBlock);
+        if (!isFinite(deploymentEnd)) throw new Error(`Invalid contract end block: ${contractData.endBlock}`);
+        const activeFrom = Math.max(fromBlock, contractData.startBlock);
+        const activeTo = Math.min(requestedEnd, deploymentEnd);
+        if (activeFrom > activeTo) continue;
+
+        const contract = new (web3 as any).eth.Contract(contractData.abi, contractData.address);
+        const events = await readEvents(filter, contract, web3, activeFrom, activeTo, maxPace, effectiveOptions);
+        for (const event of events) {
+            if (event && !event.address) {
+                allEvents.push(Object.assign({}, event, {address: contractData.address}));
+            } else {
+                allEvents.push(event);
+            }
+        }
     }
-    return allEvents;
+    return deduplicateEvents(allEvents).events.sort(ascendingEvents);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export async function readEvents(filter: (string[] | string | undefined)[], contract:any, web3:any, startBlock: number, endBlock: number | string, pace: number) {
-    try {
-        let options = {topics: filter, fromBlock: startBlock, toBlock: endBlock};
-        return await contract.getPastEvents('allEvents', options);
-    } catch (e) {
-        pace = Math.round(pace*0.9);
-        if (pace <= 100) {
-            throw new Error(`looking for events slowed down below ${pace} - fail`)
-        }
-        if (typeof endBlock === 'string') {
-            const block = await getCurrentBlockInfo(web3);
-            endBlock = block.number;
-        }
-        console.log('\x1b[36m%s\x1b[0m', `read events slowing down to ${pace}`);
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const results:any = [];
-        for(let i = startBlock; i < endBlock; i+=pace) {
-            const currentEnd = i+pace > endBlock ? endBlock : i+pace;
-            appendItems(results, await readEvents(filter, contract, web3, i, currentEnd, pace));
-            pace = maxPace;
-        }
-        console.log('\x1b[36m%s\x1b[0m', `read events slowing down ended`);
-        return results;
+export async function readEvents(
+    filter: (string[] | string | undefined)[],
+    contract: any,
+    web3: any,
+    startBlock: number,
+    endBlock: number | string,
+    pace: number,
+    queryOptions?: EventQueryOptions
+) {
+    const numericEnd = await numericEndBlock(endBlock, web3);
+    const effectiveOptions = configuredEventQueryOptions(web3, queryOptions);
+    if (effectiveOptions.initialChunkSize === undefined) effectiveOptions.initialChunkSize = pace;
+    if (effectiveOptions.maxChunkSize === undefined) effectiveOptions.maxChunkSize = pace;
+    const contractAddress = contract && contract.options ? contract.options.address : undefined;
+    const baseCacheKey = eventCacheKey(contract, filter);
+    if (effectiveOptions.cache === false || !baseCacheKey || startBlock > numericEnd) {
+        const direct = await readEventRange({
+            contract,
+            topics: filter,
+            fromBlock: startBlock,
+            toBlock: numericEnd,
+            contractAddress
+        }, effectiveOptions);
+        return direct.events;
     }
+
+    const chainId = web3.eth.getChainId ? Number(await web3.eth.getChainId()) : 0;
+    const configuredFinality = effectiveOptions.cacheFinalityBlocks;
+    if (configuredFinality !== undefined && (!isFinite(configuredFinality) || configuredFinality < 0)) {
+        throw new Error('cacheFinalityBlocks must be a non-negative finite number');
+    }
+    const finalityBlocks = configuredFinality === undefined
+        ? DEFAULT_EVENT_CACHE_FINALITY[String(chainId)] || 0
+        : Math.max(0, Math.floor(configuredFinality));
+    const key = `${baseCacheKey}:finality:${finalityBlocks}`;
+    const stableEnd = Math.max(startBlock - 1, numericEnd - finalityBlocks);
+    const cache = eventCacheHost(web3);
+    const entry = cache[key] || {coverage: [], events: []};
+    cache[key] = entry;
+    const collected = eventsWithin(entry.events, startBlock, stableEnd);
+
+    for (const range of missingCoverage(startBlock, stableEnd, entry.coverage)) {
+        const result = await readEventRange({
+            contract,
+            topics: filter,
+            fromBlock: range.fromBlock,
+            toBlock: range.toBlock,
+            contractAddress
+        }, effectiveOptions);
+        appendItems(entry.events, result.events);
+        appendItems(collected, result.events);
+        entry.coverage = normalizeCoverage(entry.coverage.concat(range));
+    }
+    entry.events = deduplicateEvents(entry.events, contractAddress).events;
+
+    const mutableFrom = Math.max(startBlock, stableEnd + 1);
+    if (mutableFrom <= numericEnd) {
+        const mutable = await readEventRange({
+            contract,
+            topics: filter,
+            fromBlock: mutableFrom,
+            toBlock: numericEnd,
+            contractAddress
+        }, effectiveOptions);
+        appendItems(collected, mutable.events);
+    }
+    return deduplicateEvents(collected, contractAddress).events.sort(ascendingEvents);
 }
 
-async function readRegisteryEvents(contractsData:ContractsData, regContract:any, startBlock:number) {
-    let options = {fromBlock: startBlock, toBlock: 'latest'};
-    const events = await regContract.getPastEvents('allEvents', options);
+async function readRegisteryEvents(
+    contractsData: ContractsData,
+    regContract: any,
+    startBlock: number,
+    web3: any,
+    queryOptions?: EventQueryOptions
+) {
+    const cacheHost = web3 as any;
+    if (!cacheHost.__posAnalyticsRegistryEventCache) cacheHost.__posAnalyticsRegistryEventCache = Object.create(null);
+    const address = regContract && regContract.options ? String(regContract.options.address).toLowerCase() : 'registry';
+    const cacheKey = `${address}:${startBlock}`;
+    let events = cacheHost.__posAnalyticsRegistryEventCache[cacheKey];
+    if (!events) {
+        events = await readEvents([], regContract, web3, startBlock, 'latest', maxPace, queryOptions);
+        cacheHost.__posAnalyticsRegistryEventCache[cacheKey] = events.slice();
+    } else {
+        events = events.slice();
+    }
     events.sort(ascendingEvents); 
     for (let event of events) {
         if (event.event === 'ContractAddressUpdated') {

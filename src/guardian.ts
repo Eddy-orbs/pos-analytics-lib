@@ -9,9 +9,11 @@
 import _ from 'lodash';
 import BigNumber from 'bignumber.js';
 import { fetchJson, bigToNumber, parseOptions, optionsStartFromText, querySubgraph} from './helpers';
-import { addressToTopic, appendItems, ascendingEvents, Contracts, getBlockEstimatedTime, generateTxLink, getWeb3, readBalances, readContractEvents, readGuardianDataFromState, Topics, getStartOfRewardsBlock, getStartOfPosBlock, getStartOfDelegationBlock, getQueryRewardsBlock, getQueryPosBlock } from "./eth-helpers";
-import { Guardian, GuardianInfo, GuardianDelegator, GuardianReward, GuardianStake, GuardianAction, DelegatorReward, PosOptions } from './model';
+import { addressToTopic, appendItems, ascendingEvents, Contracts, getBlockEstimatedTime, generateTxLink, getWeb3, readBalances, readContractEvents, readGuardianCurrentDataFromState, readGuardianDataFromState, Topics, getStartOfRewardsBlock, getStartOfPosBlock, getStartOfDelegationBlock, getQueryRewardsBlock, getQueryPosBlock } from "./eth-helpers";
+import { Guardian, GuardianCurrent, GuardianInfo, GuardianDelegator, GuardianReward, GuardianStake, GuardianAction, DelegatorReward, PosOptions } from './model';
 import { getGuardianRewardsStakingInternal, getRewardsClaimActions } from './rewards';
+
+const LEGACY_EVENT_QUERY = {loadHistoricalContractManifest: true};
 
 export async function getGuardiansCert(networkNodeUrls: string[]) {
     let fullError = '';
@@ -53,6 +55,26 @@ export async function getGuardians(networkNodeUrls: string[], ethNodeEndpoints: 
     }
 
     throw new Error(`Error while creating list of Guardians, all Netowrk Node URL failed to respond. ${fullError}`);
+}
+
+/**
+ * Reads only the Guardian's current contract state.
+ *
+ * This does not query event logs and therefore does not load actions, stake
+ * history, reward history or delegators.
+ */
+export async function getGuardianCurrent(address: string, endpointOrWeb3: string | any): Promise<GuardianCurrent> {
+    const web3 = _.isString(endpointOrWeb3) ? await getWeb3(endpointOrWeb3) : endpointOrWeb3;
+    const ethData = await readGuardianCurrentDataFromState(address, web3);
+
+    return {
+        address: address.toLowerCase(),
+        block_number: ethData.block.number,
+        block_time: ethData.block.time,
+        details: ethData.details,
+        stake_status: ethData.stake_status,
+        reward_status: ethData.reward_status,
+    };
 }
 
 export async function getGuardian(address: string, ethereumEndpoint: string | any, o?: PosOptions | any, refBlock?:{[chainId: number]: {time: number, number: number}}): Promise<GuardianInfo> {
@@ -135,7 +157,7 @@ export async function getDelegators(address: string, ethereumEndpoint: string | 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export async function getGuardianStakeAndDelegationChanges(address: string, ethState:any, web3:any, refBlock?:{[chainId: number]: {time: number, number: number}}) {
     const filter = [[Topics.DelegateStakeChanged], addressToTopic(address)];
-    const events = await readContractEvents(filter, Contracts.Delegate, web3);
+    const events = await readContractEvents(filter, Contracts.Delegate, web3, undefined, 'latest', LEGACY_EVENT_QUERY);
 
     const delegatorMap: {[key:string]: GuardianDelegator} = {};
     const delegationStakes: GuardianStake[] = [];
@@ -217,7 +239,7 @@ function addOrUpdateStakeList(stakes: GuardianStake[], blockNumber: number, self
 export async function getGuardianStakeActions(address: string, ethState:any, web3:any, options: PosOptions,  refBlock?:{[chainId: number]: {time: number, number: number}}) {
     const startBlock = getQueryPosBlock(options.read_from_block, ethState.block.number)
     const filter = [[Topics.Staked, Topics.Restaked, Topics.Unstaked, Topics.Withdrew], addressToTopic(address)];
-    const events = await readContractEvents(filter, Contracts.Stake, web3, startBlock);
+    const events = await readContractEvents(filter, Contracts.Stake, web3, startBlock, 'latest', LEGACY_EVENT_QUERY);
     events.sort(ascendingEvents);
 
     let totalStake = new BigNumber(0);
@@ -265,7 +287,7 @@ function generateStakeAction(block_number: number, block_time: number, self_stak
 export async function getGuardianRegisterationActions(address: string, ethState:any, web3:any, options: PosOptions, refBlock?:{[chainId: number]: {time: number, number: number}}) {
     const startBlock = getQueryPosBlock(options.read_from_block, ethState.block.number)
     const filter = [Topics.GuardianRegisterd, addressToTopic(address)];
-    const events = await readContractEvents(filter, Contracts.Guardian, web3, startBlock);
+    const events = await readContractEvents(filter, Contracts.Guardian, web3, startBlock, 'latest', LEGACY_EVENT_QUERY);
     const chainId = await web3.eth.getChainId();
 
     const actions: GuardianAction[] = [];    
@@ -292,7 +314,7 @@ export async function getGuardianFeeAndBootstrap(address: string, ethState:any, 
     const withdrawActions: GuardianAction[] = [];
 
     const filter = [[Topics.BootstrapRewardAssigned, Topics.FeeAssigned, Topics.BootstrapWithdrawn, Topics.FeeWithdrawn], addressToTopic(address)];
-    const events = await readContractEvents(filter, Contracts.FeeBootstrapReward, web3, startBlock);
+    const events = await readContractEvents(filter, Contracts.FeeBootstrapReward, web3, startBlock, 'latest', LEGACY_EVENT_QUERY);
     events.sort((n1:any, n2:any) => n2.blockNumber - n1.blockNumber);  // desc
 
     for (let event of events) {

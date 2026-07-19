@@ -6,10 +6,13 @@
  * The above notice should be included in all copies or substantial portions of the software.
  */
 
-export { getDelegator } from "./delegator";
-export { getGuardian, getGuardians, getDelegators } from "./guardian";
+export { getDelegator, getDelegatorCurrent } from "./delegator";
+export { getGuardian, getGuardianCurrent, getGuardians, getDelegators } from "./guardian";
+export * from './guardian-delegators-page';
 export { getAllDelegators, getOverview } from "./overview";
 export { getDelegatorStakingRewards, getGuardianStakingRewards } from "./rewards";
+export * from './history';
+export * from './query';
 export { allDelegatorsToXlsx, delegatorToXlsx, guardianToXlsx } from './xls'
 export { getStartOfDelegationBlock, getStartOfPosBlock, getStartOfRewardsBlock, getWeb3, getWeb3Polygon } from "./eth-helpers";
 
