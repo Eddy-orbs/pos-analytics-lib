@@ -32,6 +32,14 @@ function noDelayOptions(initialChunkSize: number, extra: any = {}): any {
     }, extra);
 }
 
+function noDelayCurrentRpcOptions(): any {
+    return {
+        minimumIntervalMs: 0,
+        retryDelaysMs: [0, 0, 0],
+        sleep: async () => undefined
+    };
+}
+
 async function testContiguousInclusiveChunks(): Promise<void> {
     const calls: BlockRange[] = [];
     const contract = {
@@ -372,7 +380,7 @@ async function testCurrentRegistryBootstrapUsesNoEventLogs(): Promise<void> {
         [Contracts.Stake]: []
     };
     const web3: any = {eth: {Contract: FakeContract}};
-    await readCurrentContractsAddresses(contractsData, web3, 1);
+    await readCurrentContractsAddresses(contractsData, web3, 1, 16, noDelayCurrentRpcOptions());
 
     assert.strictEqual(eventLogCalls, 0);
     assert.strictEqual(contractsData[Contracts.Registry][0].address, registry2);
@@ -380,6 +388,68 @@ async function testCurrentRegistryBootstrapUsesNoEventLogs(): Promise<void> {
     assert.strictEqual(contractsData[Contracts.Reward][0].address, reward);
     assert.strictEqual(contractsData[Contracts.FeeBootstrapReward][0].address, fees);
     assert.strictEqual(contractsData[Contracts.Guardian][0].address, guardian);
+}
+
+async function testCurrentRegistrySerializesAndRetriesTransientCalls(): Promise<void> {
+    const registry = '0x0000000000000000000000000000000000000200';
+    const delegate = '0x0000000000000000000000000000000000000210';
+    const current: {[name: string]: string} = {
+        [Contracts.Delegate]: delegate,
+        [Contracts.Reward]: '0x0000000000000000000000000000000000000221',
+        [Contracts.FeeBootstrapReward]: '0x0000000000000000000000000000000000000222',
+        [Contracts.Guardian]: '0x0000000000000000000000000000000000000223'
+    };
+    let activeCalls = 0;
+    let maximumActiveCalls = 0;
+    let rewardAttempts = 0;
+    const runCall = async (name: string): Promise<string> => {
+        activeCalls += 1;
+        maximumActiveCalls = Math.max(maximumActiveCalls, activeCalls);
+        await Promise.resolve();
+        activeCalls -= 1;
+        if (name === Contracts.Reward && rewardAttempts++ === 0) {
+            const error: any = new Error('429 rate limit');
+            error.status = 429;
+            throw error;
+        }
+        return current[name];
+    };
+    const FakeContract: any = function(_abi: any, address: string): any {
+        const normalized = address.toLowerCase();
+        return {
+            methods: {
+                getContract: (name: string) => ({call: () => runCall(name)}),
+                getContractRegistry: () => ({call: async () => {
+                    activeCalls += 1;
+                    maximumActiveCalls = Math.max(maximumActiveCalls, activeCalls);
+                    await Promise.resolve();
+                    activeCalls -= 1;
+                    return normalized === delegate ? registry : registry;
+                }})
+            }
+        };
+    };
+    const contractsData: ContractsData = {
+        [Contracts.Delegate]: [],
+        [Contracts.Reward]: [],
+        [Contracts.FeeBootstrapReward]: [],
+        [Contracts.Guardian]: [],
+        [Contracts.Registry]: [{address: registry, startBlock: 1, endBlock: 'latest', abi: []}],
+        [Contracts.Erc20]: [],
+        [Contracts.Stake]: []
+    };
+
+    await readCurrentContractsAddresses(
+        contractsData,
+        {eth: {Contract: FakeContract}},
+        1,
+        16,
+        noDelayCurrentRpcOptions()
+    );
+
+    assert.strictEqual(rewardAttempts, 2, 'a transient 429 should retry the same current-state call');
+    assert.strictEqual(maximumActiveCalls, 1, 'startup contract calls must remain serial');
+    assert.strictEqual(contractsData[Contracts.Reward][0].address, current[Contracts.Reward]);
 }
 
 async function testHistoricalManifestIsExplicitLazyAndLoadedOnce(): Promise<void> {
@@ -455,7 +525,7 @@ async function testHistoricalManifestIsExplicitLazyAndLoadedOnce(): Promise<void
             getChainId: async () => 1
         }
     };
-    await readCurrentContractsAddresses(contractsData, web3, 1);
+    await readCurrentContractsAddresses(contractsData, web3, 1, 16, noDelayCurrentRpcOptions());
     web3.contractsData = contractsData;
 
     await readContractEvents([], Contracts.Delegate, web3, base + 200, base + 210, noDelayOptions(100, {cache: false}));
@@ -498,6 +568,7 @@ async function run(): Promise<void> {
     await testDeploymentRangeIntersection();
     await testPolygonDefaultStartAndDedupe();
     await testCurrentRegistryBootstrapUsesNoEventLogs();
+    await testCurrentRegistrySerializesAndRetriesTransientCalls();
     await testHistoricalManifestIsExplicitLazyAndLoadedOnce();
     console.log('event-reader tests passed');
 }

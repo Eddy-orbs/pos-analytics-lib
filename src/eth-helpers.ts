@@ -67,7 +67,20 @@ export interface ContractsData {[key:string]: ContractValidData[]};
 
 const maxPace = 4000000;
 
-export async function getWeb3(ethereumEndpoint: string, readContracts:boolean = true) {
+export interface CurrentContractAddresses {
+    contractRegistry?: string;
+    staking?: string;
+    stakingRewards?: string;
+    feesAndBootstrapRewards?: string;
+    delegations?: string;
+    guardiansRegistration?: string;
+}
+
+export async function getWeb3(
+    ethereumEndpoint: string,
+    readContracts:boolean = true,
+    currentContractAddresses?: CurrentContractAddresses
+) {
    const web3 = new Web3(new Web3.providers.HttpProvider(ethereumEndpoint, {keepAlive: true,}));
     web3.eth.transactionBlockTimeout = 0; // to stop web3 from polling pending tx
     web3.eth.transactionPollingTimeout = 0; // to stop web3 from polling pending tx
@@ -84,14 +97,19 @@ export async function getWeb3(ethereumEndpoint: string, readContracts:boolean = 
     contractsData[Contracts.Registry] = [{address: '0xD859701C81119aB12A1e62AF6270aD2AE05c7AB3', startBlock: 11191400, endBlock: 'latest', abi: registryAbi /*getAbiByContractName(Contracts.Registry)*/ }];
     
     if (readContracts) {
-        await readCurrentContractsAddresses(contractsData, web3, 1);
+        if (currentContractAddresses) applyCurrentContractAddresses(contractsData, web3, 1, currentContractAddresses);
+        else await readCurrentContractsAddresses(contractsData, web3, 1);
         Object.assign(web3, {contractsData});
     }
 
     return web3;
 }
 
-export async function getWeb3Polygon(ethereumEndpoint: string, readContracts:boolean = true) {
+export async function getWeb3Polygon(
+    ethereumEndpoint: string,
+    readContracts:boolean = true,
+    currentContractAddresses?: CurrentContractAddresses
+) {
     const web3 = new Web3(new Web3.providers.HttpProvider(ethereumEndpoint, {keepAlive: true,}));
     web3.eth.transactionBlockTimeout = 0; // to stop web3 from polling pending tx
     web3.eth.transactionPollingTimeout = 0; // to stop web3 from polling pending tx
@@ -108,7 +126,8 @@ export async function getWeb3Polygon(ethereumEndpoint: string, readContracts:boo
     contractsData[Contracts.Registry] = [{address: '0x35eA0D75b2a3aB06393749B4651DfAD1Ffd49A77', startBlock: 25502848, endBlock: 'latest', abi: registryAbi /*getAbiByContractName(Contracts.Registry)*/ }];
 
     if (readContracts) {
-        await readCurrentContractsAddresses(contractsData, web3, 137);
+        if (currentContractAddresses) applyCurrentContractAddresses(contractsData, web3, 137, currentContractAddresses);
+        else await readCurrentContractsAddresses(contractsData, web3, 137);
         Object.assign(web3, {contractsData});
     }
 
@@ -117,6 +136,8 @@ export async function getWeb3Polygon(ethereumEndpoint: string, readContracts:boo
 
 const MAX_CURRENT_REGISTRY_HOPS = 16;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+const CURRENT_RPC_MIN_INTERVAL_MS = 500;
+const CURRENT_RPC_RETRY_DELAYS_MS = [750, 1500, 3000];
 const HISTORICAL_CONTRACT_TYPES = [
     Contracts.Delegate,
     Contracts.Reward,
@@ -158,6 +179,93 @@ function normalizedContractAddress(address: any, description: string): string {
     return normalized;
 }
 
+function applyCurrentContractAddresses(
+    contractsData: ContractsData,
+    web3: any,
+    chainId: number,
+    addresses: CurrentContractAddresses
+): void {
+    const initialRegistry = contractsData[Contracts.Registry] && contractsData[Contracts.Registry][0];
+    if (!initialRegistry) throw new Error('Missing initial ContractRegistry configuration');
+    historicalManifestState(web3, initialRegistry);
+    const startBlock = getStartOfPosBlock(chainId).number;
+    const resolved: Array<{type: Contracts; address: any}> = [
+        {type: Contracts.Delegate, address: addresses.delegations},
+        {type: Contracts.Reward, address: addresses.stakingRewards},
+        {type: Contracts.FeeBootstrapReward, address: addresses.feesAndBootstrapRewards},
+        {type: Contracts.Guardian, address: addresses.guardiansRegistration}
+    ];
+    resolved.forEach(entry => {
+        const address = normalizedContractAddress(entry.address, entry.type);
+        contractsData[entry.type] = [{
+            address,
+            startBlock,
+            endBlock: 'latest',
+            abi: getAbiForContract(address, entry.type)
+        }];
+    });
+    if (addresses.staking) {
+        const stakeAddress = normalizedContractAddress(addresses.staking, 'staking');
+        contractsData[Contracts.Stake] = [{address: stakeAddress, startBlock, endBlock: 'latest', abi: stakeAbi}];
+    }
+    contractsData[Contracts.Registry] = [{
+        address: normalizedContractAddress(addresses.contractRegistry, 'contractRegistry'),
+        startBlock,
+        endBlock: 'latest',
+        abi: registryAbi
+    }];
+}
+
+function delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isRetryableCurrentRpcError(error: any): boolean {
+    const status = Number(error && (error.status || error.statusCode));
+    const code = String(error && error.code || '').toLowerCase();
+    const message = String(error && error.message || error || '').toLowerCase();
+    return status === 429 || status === 408 || status >= 500 || code === '429' ||
+        /rate[ -]?limit|too many requests|compute units|throughput|timeout|timed out|temporar|gateway|network|fetch failed|connection|socket/.test(message);
+}
+
+/** Serializes the few startup eth_call requests and retries only transient failures. */
+class CurrentRpcExecutor {
+    private lastStartedAt = 0;
+
+    constructor(
+        private readonly minimumIntervalMs: number = CURRENT_RPC_MIN_INTERVAL_MS,
+        private readonly retryDelaysMs: number[] = CURRENT_RPC_RETRY_DELAYS_MS,
+        private readonly sleep: (ms: number) => Promise<void> = delay,
+        private readonly now: () => number = Date.now
+    ) {}
+
+    async call<T>(operation: () => Promise<T>): Promise<T> {
+        for (let attempt = 0; ; attempt += 1) {
+            const pacingDelay = Math.max(0, this.minimumIntervalMs - (this.now() - this.lastStartedAt));
+            if (pacingDelay > 0) await this.sleep(pacingDelay);
+            this.lastStartedAt = this.now();
+            try {
+                return await operation();
+            } catch (error) {
+                if (!isRetryableCurrentRpcError(error) || attempt >= this.retryDelaysMs.length) throw error;
+                await this.sleep(this.retryDelaysMs[attempt]);
+            }
+        }
+    }
+}
+
+function currentAggregate(calls: any[], config: any): Promise<any> {
+    const rpc = new CurrentRpcExecutor();
+    return rpc.call(() => aggregate(calls, config));
+}
+
+export interface CurrentRpcOptions {
+    minimumIntervalMs?: number;
+    retryDelaysMs?: number[];
+    sleep?: (ms: number) => Promise<void>;
+    now?: () => number;
+}
+
 /**
  * Resolve only the contracts used for current state reads. Registry migrations
  * are followed with eth_call; startup deliberately performs no eth_getLogs.
@@ -166,7 +274,8 @@ export async function readCurrentContractsAddresses(
     contractsData: ContractsData,
     web3: any,
     chainId: number,
-    maxRegistryHops: number = MAX_CURRENT_REGISTRY_HOPS
+    maxRegistryHops: number = MAX_CURRENT_REGISTRY_HOPS,
+    options: CurrentRpcOptions = {}
 ): Promise<ContractsData> {
     const initialRegistry = contractsData[Contracts.Registry] && contractsData[Contracts.Registry][0];
     if (!initialRegistry) throw new Error('Missing initial ContractRegistry configuration');
@@ -175,6 +284,12 @@ export async function readCurrentContractsAddresses(
     let registryAddress = normalizedContractAddress(initialRegistry.address, 'registry');
     let delegateAddress = '';
     const visited: {[address: string]: boolean} = Object.create(null);
+    const rpc = new CurrentRpcExecutor(
+        options.minimumIntervalMs,
+        options.retryDelaysMs,
+        options.sleep,
+        options.now
+    );
 
     for (let hop = 0; hop < boundedHops; hop += 1) {
         if (visited[registryAddress]) {
@@ -183,12 +298,12 @@ export async function readCurrentContractsAddresses(
         visited[registryAddress] = true;
         const registry = new web3.eth.Contract(registryAbi, registryAddress);
         delegateAddress = normalizedContractAddress(
-            await registry.methods.getContract(Contracts.Delegate).call(),
+            await rpc.call(() => registry.methods.getContract(Contracts.Delegate).call()),
             Contracts.Delegate
         );
         const delegation = new web3.eth.Contract(delegationAbi, delegateAddress);
         const delegationRegistry = normalizedContractAddress(
-            await delegation.methods.getContractRegistry().call(),
+            await rpc.call(() => delegation.methods.getContractRegistry().call()),
             'delegation registry'
         );
         if (delegationRegistry === registryAddress) break;
@@ -201,12 +316,12 @@ export async function readCurrentContractsAddresses(
     }
 
     const currentRegistry = new web3.eth.Contract(registryAbi, registryAddress);
-    const currentAddresses = await Promise.all([
-        Promise.resolve(delegateAddress),
-        currentRegistry.methods.getContract(Contracts.Reward).call(),
-        currentRegistry.methods.getContract(Contracts.FeeBootstrapReward).call(),
-        currentRegistry.methods.getContract(Contracts.Guardian).call()
-    ]);
+    const currentAddresses = [
+        delegateAddress,
+        await rpc.call(() => currentRegistry.methods.getContract(Contracts.Reward).call()),
+        await rpc.call(() => currentRegistry.methods.getContract(Contracts.FeeBootstrapReward).call()),
+        await rpc.call(() => currentRegistry.methods.getContract(Contracts.Guardian).call())
+    ];
     const currentTypes = [Contracts.Delegate, Contracts.Reward, Contracts.FeeBootstrapReward, Contracts.Guardian];
     const startBlock = getStartOfPosBlock(chainId).number;
     currentTypes.forEach((contractType, index) => {
@@ -387,7 +502,7 @@ export async function readBalances(addresses:string[], web3:any) {
             returns: [[address, (v: BigNumber.Value) => bigToNumber(new BigNumber(v))]]
         });
     }
-    const r = await aggregate(calls, config);
+    const r = await currentAggregate(calls, config);
     return r.results.transformed;
 }
 
@@ -404,7 +519,7 @@ export async function readStakes(addresses:string[], web3:any) {
             returns: [[address, (v: BigNumber.Value) => bigToNumber(new BigNumber(v))]]
         });
     }
-    const r = await aggregate(calls, config);
+    const r = await currentAggregate(calls, config);
     return r.results.transformed;
 }
 
@@ -430,7 +545,7 @@ export async function readOverviewDataFromState(web3:any) {
         },
     ];
 
-    const r = await aggregate(calls, config);
+    const r = await currentAggregate(calls, config);
     return { block: multicallToBlockInfo(r),
              totalStake: bigToNumber(r.results.transformed['staked'].minus(r.results.transformed['uncapped']))};
 }
@@ -476,7 +591,7 @@ export async function readDelegatorCurrentDataFromState(address:string, web3:any
             returns: [[CURRENT_BLOCK_TIMESTAMP]]
         }
     ];
-    const result = await aggregate(calls, config);
+    const result = await currentAggregate(calls, config);
     const data = result.results.transformed;
     return {
         block: multicallToBlockInfo(result),
@@ -531,7 +646,7 @@ async function readDelegatorState(address:string, web3:any) {
         }
     ];
 
-    const r = await aggregate(calls, config);
+    const r = await currentAggregate(calls, config);
     return { block: multicallToBlockInfo(r), data: r.results.transformed};
 }
 
@@ -623,7 +738,7 @@ export async function readGuardianCurrentDataFromState(address:string, web3:any)
             returns: [[CURRENT_BLOCK_TIMESTAMP]]
         }
     ];
-    const result = await aggregate(calls, config);
+    const result = await currentAggregate(calls, config);
     const data = result.results.transformed;
     return {
         block: multicallToBlockInfo(result),
@@ -755,7 +870,7 @@ async function readGuardianState(address:string, web3:any) {
         }
     ];
 
-    const r = await aggregate(calls, config);
+    const r = await currentAggregate(calls, config);
     return { block: multicallToBlockInfo(r), data: r.results.transformed};
 }
 
