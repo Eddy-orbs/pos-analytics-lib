@@ -91,10 +91,77 @@ async function testDifferentFinalityPoliciesDoNotShareCoverage(): Promise<void> 
     ]);
 }
 
+async function testCompletedChunksSurviveAbort(): Promise<void> {
+    const calls: CallRange[] = [];
+    const controller = new AbortController();
+    const contract = {
+        options: {address: '0xpartial'},
+        getPastEvents: async (_name: string, query: any) => {
+            calls.push({fromBlock: query.fromBlock, toBlock: query.toBlock});
+            if (query.fromBlock === 1) controller.abort();
+            return [event(query.fromBlock)];
+        }
+    };
+    const web3: any = {eth: {getChainId: async () => 1}};
+    try {
+        await readEvents([], contract, web3, 1, 6, 2, {
+            cacheFinalityBlocks: 0,
+            initialChunkSize: 2,
+            maxChunkSize: 2,
+            signal: controller.signal
+        });
+    } catch (error) {
+        assert.strictEqual((error as any).name, 'AbortError');
+    }
+
+    await readEvents([], contract, web3, 1, 6, 2, {
+        cacheFinalityBlocks: 0,
+        initialChunkSize: 2,
+        maxChunkSize: 2
+    });
+    assert.deepStrictEqual(calls, [
+        {fromBlock: 1, toBlock: 2},
+        {fromBlock: 3, toBlock: 4},
+        {fromBlock: 5, toBlock: 6}
+    ]);
+}
+
+async function testMutableTailCanBeReusedWithinExplicitTtl(): Promise<void> {
+    const calls: CallRange[] = [];
+    let now = 100;
+    const contract = {
+        options: {address: '0xmutable'},
+        getPastEvents: async (_name: string, query: any) => {
+            calls.push({fromBlock: query.fromBlock, toBlock: query.toBlock});
+            return [];
+        }
+    };
+    const web3: any = {eth: {getChainId: async () => 1}};
+    const options = {
+        cacheFinalityBlocks: 2,
+        cacheMutableForMs: 1000,
+        initialChunkSize: 1000,
+        maxChunkSize: 1000,
+        dependencies: {now: () => now}
+    };
+    await readEvents([], contract, web3, 1, 10, 1000, options);
+    await readEvents([], contract, web3, 1, 10, 1000, options);
+    assert.deepStrictEqual(calls, [
+        {fromBlock: 1, toBlock: 8},
+        {fromBlock: 9, toBlock: 10}
+    ], 'an unchanged mutable tail should be reused inside the explicit TTL');
+
+    now += 1000;
+    await readEvents([], contract, web3, 1, 10, 1000, options);
+    assert.deepStrictEqual(calls[calls.length - 1], {fromBlock: 9, toBlock: 10});
+}
+
 async function run(): Promise<void> {
     await testOverlappingRangesReuseStableCoverage();
     await testCacheCanBeDisabled();
     await testDifferentFinalityPoliciesDoNotShareCoverage();
+    await testCompletedChunksSurviveAbort();
+    await testMutableTailCanBeReusedWithinExplicitTtl();
     console.log('event-cache tests passed');
 }
 

@@ -149,9 +149,12 @@ export interface GuardianStake {
     block_number: number;
     block_time: number;
     self_stake: number;
-    delegated_stake: number; // note unlike the contract this is only 
+    delegated_stake: number; // Unlike the contract aggregate, this excludes self stake.
     total_stake: number;
     n_delegates: number;
+    /** Event identity is present for exact event-reconstruction points. */
+    transaction_hash?: string;
+    log_index?: number;
 }
 
 export interface GuardianAction extends Action {}
@@ -231,12 +234,18 @@ export interface StakeHistoryDataQuality {
     anchor_source: 'current-state-reverse' | 'prior-event' | 'first-event' | 'chain-start' | 'current-flat' | 'first-event-backfill' | 'archive-state-call';
     /** The data acquisition strategy used for this response. */
     mode?: 'event-reconstruction' | 'sampled-state';
+    /** Transport used to obtain exact stake event points. */
+    event_source?: 'rpc-logs' | 'subgraph+rpc-logs';
     /** Whether requested timestamps were mapped to exact or estimated blocks. */
     block_resolution?: 'exact' | 'linear-estimate-one-step-correction';
     /** True when every historical stake value came from an archive eth_call. */
     sampled_state?: boolean;
-    /** Guardian event logs do not contain an exact aggregate delegator count. */
+    /** Whether an exact active-delegator count was reconstructed for every point. */
     n_delegates_available?: boolean;
+    /** Source used to seed and incrementally reconstruct the active count. */
+    n_delegates_source?: 'subgraph-checkpoint+range-events' | 'unavailable';
+    /** Block represented by the active-delegator checkpoint, when available. */
+    n_delegates_checkpoint_block?: number;
     notes?: string[];
 }
 
@@ -261,6 +270,9 @@ export interface DelegatorStake {
     block_time: number;
     stake: number;
     cooldown: number;
+    /** Event identity is omitted only for synthetic range/current anchors. */
+    transaction_hash?: string;
+    log_index?: number;
 }
 
 export interface DelegatorAction extends Action {}

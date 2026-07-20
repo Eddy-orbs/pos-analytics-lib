@@ -265,7 +265,7 @@ export async function getSampledDelegatorStakeHistory(
     state: SampledDelegatorCurrentState,
     executor: StateCallExecutor
 ): Promise<DelegatorStakeHistory> {
-    const fromBlock = Math.floor(query.from_block);
+    const fromBlock = Math.floor(query.from_block as number);
     const rangeStart = fromBlock === state.block.number
         ? state.block
         : blockAnchor(
@@ -348,7 +348,7 @@ export async function getSampledGuardianStakeHistory(
     state: SampledGuardianCurrentState,
     executor: StateCallExecutor
 ): Promise<GuardianStakeHistory> {
-    const fromBlock = Math.floor(query.from_block);
+    const fromBlock = Math.floor(query.from_block as number);
     const rangeStart = fromBlock === state.block.number
         ? state.block
         : blockAnchor(

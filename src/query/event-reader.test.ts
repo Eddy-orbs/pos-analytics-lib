@@ -1,6 +1,6 @@
 import assert from 'assert';
 import { Contracts, ContractsData, readContractEvents, readCurrentContractsAddresses } from '../eth-helpers';
-import { classifyRpcError, EventQueryError, readEventRange } from './event-reader';
+import { classifyRpcError, EventQueryChunk, EventQueryError, readEventRange } from './event-reader';
 
 interface BlockRange {
     fromBlock: number;
@@ -169,6 +169,7 @@ async function testMinimumRequestInterval(): Promise<void> {
 
 async function testAbortImmediatelyAfterRpcResponse(): Promise<void> {
     const controller = new AbortController();
+    const completedChunks: BlockRange[] = [];
     const contract = {
         getPastEvents: async () => {
             controller.abort();
@@ -178,7 +179,8 @@ async function testAbortImmediatelyAfterRpcResponse(): Promise<void> {
     let received: any;
     try {
         await readEventRange({contract, topics: [], fromBlock: 1, toBlock: 1}, noDelayOptions(1, {
-            signal: controller.signal
+            signal: controller.signal,
+            onChunk: (chunk: EventQueryChunk) => completedChunks.push({fromBlock: chunk.fromBlock, toBlock: chunk.toBlock})
         }));
     } catch (error) {
         received = error;
@@ -186,6 +188,7 @@ async function testAbortImmediatelyAfterRpcResponse(): Promise<void> {
     assert.ok(received);
     assert.strictEqual(received.name, 'AbortError');
     assert.ok(!(received instanceof EventQueryError));
+    assert.deepStrictEqual(completedChunks, [{fromBlock: 1, toBlock: 1}], 'a completed RPC chunk must survive a later abort');
 }
 
 async function testPacingSleepIsAbortAware(): Promise<void> {

@@ -11,6 +11,7 @@ import BigNumber from 'bignumber.js';
 // import fetch from 'node-fetch';
 import { retry } from 'ts-retry-promise';
 import { PosOptions } from './model';
+import {fetchSubgraphGraphQl, getSubgraphUrl} from './subgraph/client';
 
 export const DECIMALS = '1e18';
 export function bigToNumber(n: BigNumber):number {
@@ -73,10 +74,8 @@ export function optionsStartFromText(options: PosOptions, currentBlockNumber: nu
   return options.read_from_block < 0 ? currentBlockNumber+options.read_from_block : options.read_from_block;
 }
 
-export async function querySubgraph(chainId: number, query: string, variables: any) {
-  const SUBGRAPH_URL = chainId === 137
-      ? 'https://hub.orbs.network/delegationsSubgraphPolygon'
-      : 'https://hub.orbs.network/delegationsSubgraphEth'
+export async function querySubgraph(chainId: number, query: string, variables: any, subgraphBaseUrl?: string) {
+  const subgraphUrl = getSubgraphUrl(chainId, subgraphBaseUrl);
   const PAGE_SIZE = 100;
   let allResults: any[] = [];
   let hasMore = true;
@@ -94,28 +93,9 @@ export async function querySubgraph(chainId: number, query: string, variables: a
         `${queryName}(first: ${PAGE_SIZE}, skip: ${skip},`
     );
 
-    const response = await fetch(SUBGRAPH_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        query: paginatedQuery,
-        variables,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    const { data, errors } = await response.json();
-
-    if (errors) {
-      throw new Error(`GraphQL errors: ${JSON.stringify(errors)}`);
-    }
-
+    const data = await fetchSubgraphGraphQl(subgraphUrl, paginatedQuery, variables);
     const results = data[queryName];
+    if (!Array.isArray(results)) throw new Error(`Subgraph response '${queryName}' is invalid`);
     allResults = allResults.concat(results);
 
     if (results.length < PAGE_SIZE) {

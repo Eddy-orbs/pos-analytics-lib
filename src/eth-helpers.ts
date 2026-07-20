@@ -833,6 +833,12 @@ interface CachedEventCoverage {
 interface EventRangeCacheEntry {
     coverage: CachedEventCoverage[];
     events: any[];
+    mutable?: {
+        fromBlock: number;
+        toBlock: number;
+        events: any[];
+        loadedAt: number;
+    };
 }
 
 const DEFAULT_EVENT_CACHE_FINALITY: {[chainId: string]: number} = {
@@ -972,6 +978,12 @@ export async function readEvents(
     const finalityBlocks = configuredFinality === undefined
         ? DEFAULT_EVENT_CACHE_FINALITY[String(chainId)] || 0
         : Math.max(0, Math.floor(configuredFinality));
+    const mutableCacheTtl = effectiveOptions.cacheMutableForMs === undefined
+        ? 0
+        : Number(effectiveOptions.cacheMutableForMs);
+    if (!isFinite(mutableCacheTtl) || mutableCacheTtl < 0) {
+        throw new Error('cacheMutableForMs must be a non-negative finite number');
+    }
     const key = `${baseCacheKey}:finality:${finalityBlocks}`;
     const stableEnd = Math.max(startBlock - 1, numericEnd - finalityBlocks);
     const cache = eventCacheHost(web3);
@@ -980,29 +992,60 @@ export async function readEvents(
     const collected = eventsWithin(entry.events, startBlock, stableEnd);
 
     for (const range of missingCoverage(startBlock, stableEnd, entry.coverage)) {
+        const callerOnChunk = effectiveOptions.onChunk;
         const result = await readEventRange({
             contract,
             topics: filter,
             fromBlock: range.fromBlock,
             toBlock: range.toBlock,
             contractAddress
-        }, effectiveOptions);
-        appendItems(entry.events, result.events);
+        }, Object.assign({}, effectiveOptions, {
+            onChunk: (chunk: any) => {
+                appendItems(entry.events, chunk.events);
+                entry.events = deduplicateEvents(entry.events, contractAddress).events;
+                entry.coverage = normalizeCoverage(entry.coverage.concat({
+                    fromBlock: chunk.fromBlock,
+                    toBlock: chunk.toBlock
+                }));
+                if (callerOnChunk) callerOnChunk(chunk);
+            }
+        }));
         appendItems(collected, result.events);
-        entry.coverage = normalizeCoverage(entry.coverage.concat(range));
     }
     entry.events = deduplicateEvents(entry.events, contractAddress).events;
 
     const mutableFrom = Math.max(startBlock, stableEnd + 1);
     if (mutableFrom <= numericEnd) {
-        const mutable = await readEventRange({
-            contract,
-            topics: filter,
-            fromBlock: mutableFrom,
-            toBlock: numericEnd,
-            contractAddress
-        }, effectiveOptions);
-        appendItems(collected, mutable.events);
+        const now = effectiveOptions.dependencies && effectiveOptions.dependencies.now
+            ? effectiveOptions.dependencies.now()
+            : Date.now();
+        const cachedMutable = entry.mutable;
+        const canReuseMutable = mutableCacheTtl > 0 &&
+            !!cachedMutable &&
+            cachedMutable.fromBlock <= mutableFrom &&
+            cachedMutable.toBlock >= numericEnd &&
+            now - cachedMutable.loadedAt >= 0 &&
+            now - cachedMutable.loadedAt < mutableCacheTtl;
+        if (canReuseMutable && cachedMutable) {
+            appendItems(collected, eventsWithin(cachedMutable.events, mutableFrom, numericEnd));
+        } else {
+            const mutable = await readEventRange({
+                contract,
+                topics: filter,
+                fromBlock: mutableFrom,
+                toBlock: numericEnd,
+                contractAddress
+            }, effectiveOptions);
+            appendItems(collected, mutable.events);
+            if (mutableCacheTtl > 0) {
+                entry.mutable = {
+                    fromBlock: mutableFrom,
+                    toBlock: numericEnd,
+                    events: deduplicateEvents(mutable.events, contractAddress).events,
+                    loadedAt: now
+                };
+            }
+        }
     }
     return deduplicateEvents(collected, contractAddress).events.sort(ascendingEvents);
 }

@@ -146,6 +146,9 @@ async function testInitialScanCursorAndIncrementalHydration(): Promise<void> {
     assert.deepStrictEqual(fixture.calls, [{fromBlock: POS_START + 6, toBlock: POS_START + 9}]);
     assert.deepStrictEqual(subgraphCalls, [POS_START + 9]);
     assert.deepStrictEqual(hydratedPages, [[B, C]]);
+    assert.deepStrictEqual(first.cache_snapshot.items.map(item => item.address), [A, B, C]);
+    assert.strictEqual(first.cache_snapshot.as_of_block, POS_START + 9);
+    assert.strictEqual(first.cache_snapshot.subgraph_base_url, 'https://hub.orbs.network');
 
     const second = await getGuardianDelegatorsPage(GUARDIAN, fixture.web3, {
         ...common,
@@ -179,6 +182,86 @@ async function testInitialScanCursorAndIncrementalHydration(): Promise<void> {
     assert.strictEqual(subgraphCalls.length, 1);
 }
 
+async function testDurableSnapshotResumesOnANewWeb3Instance(): Promise<void> {
+    const initial = fakeWeb3(POS_START + 10, [
+        delegateEvent(C, POS_START + 7, 200, 0)
+    ]);
+    const first = await getGuardianDelegatorsPage(GUARDIAN, initial.web3, {
+        page_size: 2,
+        finality_blocks: 1,
+        event_query_options: eventOptions(),
+        dependencies: {
+            readSubgraphSnapshot: async () => ({
+                block_number: POS_START + 5,
+                has_indexing_errors: false,
+                items: [
+                    subgraphItem(A, 100, POS_START + 1),
+                    subgraphItem(B, 300, POS_START + 2)
+                ]
+            }),
+            readBalances: async addresses => addresses.reduce((result, address) => {
+                result[address] = 1;
+                return result;
+            }, {} as {[address: string]: number})
+        }
+    });
+    assert.ok(first.next_cursor);
+
+    // A browser reload creates a new Web3 identity. The complete persisted
+    // active set restores the cursor page without a Subgraph or log replay.
+    const cursorReload = fakeWeb3(POS_START + 10, []);
+    let cursorSubgraphCalls = 0;
+    const restoredCursor = await getGuardianDelegatorsPage(GUARDIAN, cursorReload.web3, {
+        page_size: 2,
+        cursor: first.next_cursor,
+        cached_snapshot: first.cache_snapshot,
+        dependencies: {
+            readSubgraphSnapshot: async () => {
+                cursorSubgraphCalls += 1;
+                throw new Error('must not rebuild');
+            },
+            readBalances: async addresses => addresses.reduce((result, address) => {
+                result[address] = 2;
+                return result;
+            }, {} as {[address: string]: number})
+        }
+    });
+    assert.strictEqual(restoredCursor.cache_status, 'cursor-hit');
+    assert.deepStrictEqual(restoredCursor.items.map(item => item.address), [A]);
+    assert.deepStrictEqual(cursorReload.calls, []);
+    assert.strictEqual(cursorSubgraphCalls, 0);
+
+    // On a later head only the stable suffix after the persisted boundary is
+    // queried and merged into a new complete snapshot.
+    const deltaReload = fakeWeb3(POS_START + 14, [
+        delegateEvent(B, POS_START + 11, 0, 0),
+        delegateEvent(D, POS_START + 12, 400, 0)
+    ]);
+    let deltaSubgraphCalls = 0;
+    const refreshed = await getGuardianDelegatorsPage(GUARDIAN, deltaReload.web3, {
+        page_size: 2,
+        finality_blocks: 1,
+        cached_snapshot: first.cache_snapshot,
+        event_query_options: eventOptions(),
+        dependencies: {
+            readSubgraphSnapshot: async () => {
+                deltaSubgraphCalls += 1;
+                throw new Error('must not rebuild');
+            },
+            readBalances: async addresses => addresses.reduce((result, address) => {
+                result[address] = 3;
+                return result;
+            }, {} as {[address: string]: number})
+        }
+    });
+    assert.strictEqual(refreshed.cache_status, 'incremental-scan');
+    assert.deepStrictEqual(deltaReload.calls, [{fromBlock: POS_START + 10, toBlock: POS_START + 13}]);
+    assert.strictEqual(deltaSubgraphCalls, 0);
+    assert.deepStrictEqual(refreshed.items.map(item => item.address), [D, C]);
+    assert.deepStrictEqual(refreshed.cache_snapshot.items.map(item => item.address), [A, C, D]);
+    assert.strictEqual(refreshed.total, 3);
+}
+
 async function testSubgraphFailureFallsBackToFullRpcScan(): Promise<void> {
     const fixture = fakeWeb3(POS_START + 5, [
         delegateEvent(A, POS_START + 1, 100, 0),
@@ -209,6 +292,64 @@ async function testSubgraphFailureFallsBackToFullRpcScan(): Promise<void> {
     assert.deepStrictEqual(result.items.map(item => item.address), [B]);
     assert.deepStrictEqual(fixture.calls, [{fromBlock: POS_START, toBlock: POS_START + 4}]);
     assert.deepStrictEqual(hydratedPages, [[B]]);
+}
+
+async function testStaleSubgraphFailsClosedWithoutLongRpcDelta(): Promise<void> {
+    const fixture = fakeWeb3(POS_START + 60010, []);
+    let failure: any;
+    try {
+        await getGuardianDelegatorsPage(GUARDIAN, fixture.web3, {
+            finality_blocks: 1,
+            dependencies: {
+                readSubgraphSnapshot: async () => ({
+                    block_number: POS_START + 5,
+                    has_indexing_errors: false,
+                    items: []
+                })
+            }
+        });
+    } catch (error) {
+        failure = error;
+    }
+    assert.ok(failure && /refusing an unbounded RPC delta/.test(failure.message));
+    assert.deepStrictEqual(fixture.calls, []);
+}
+
+async function testDurableSnapshotIsScopedToSubgraphBaseUrl(): Promise<void> {
+    const initial = fakeWeb3(POS_START + 10, []);
+    const first = await getGuardianDelegatorsPage(GUARDIAN, initial.web3, {
+        finality_blocks: 1,
+        dependencies: {
+            readSubgraphSnapshot: async () => ({
+                block_number: POS_START + 9,
+                has_indexing_errors: false,
+                items: [subgraphItem(A, 1, POS_START + 1)]
+            }),
+            readBalances: async () => ({[A]: 0})
+        }
+    });
+
+    const switched = fakeWeb3(POS_START + 10, []);
+    let localSubgraphReads = 0;
+    const local = await getGuardianDelegatorsPage(GUARDIAN, switched.web3, {
+        finality_blocks: 1,
+        subgraph_base_url: 'https://hub.orbs.kryp.xyz/',
+        cached_snapshot: first.cache_snapshot,
+        dependencies: {
+            readSubgraphSnapshot: async () => {
+                localSubgraphReads += 1;
+                return {
+                    block_number: POS_START + 9,
+                    has_indexing_errors: false,
+                    items: [subgraphItem(B, 2, POS_START + 2)]
+                };
+            },
+            readBalances: async () => ({[B]: 0})
+        }
+    });
+    assert.strictEqual(localSubgraphReads, 1);
+    assert.deepStrictEqual(local.items.map(item => item.address), [B]);
+    assert.strictEqual(local.cache_snapshot.subgraph_base_url, 'https://hub.orbs.kryp.xyz');
 }
 
 async function testFullRpcFallbackIsOptIn(): Promise<void> {
@@ -268,7 +409,10 @@ async function testCursorValidationAndAbort(): Promise<void> {
 
 async function run(): Promise<void> {
     await testInitialScanCursorAndIncrementalHydration();
+    await testDurableSnapshotResumesOnANewWeb3Instance();
     await testSubgraphFailureFallsBackToFullRpcScan();
+    await testStaleSubgraphFailsClosedWithoutLongRpcDelta();
+    await testDurableSnapshotIsScopedToSubgraphBaseUrl();
     await testFullRpcFallbackIsOptIn();
     testLegacySubgraphEventsBuildActiveSet();
     await testCursorValidationAndAbort();

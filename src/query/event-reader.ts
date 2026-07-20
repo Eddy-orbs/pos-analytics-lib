@@ -39,13 +39,27 @@ export interface EventQueryOptions {
     /** Latest blocks kept out of the range cache. Defaults are chain-aware. */
     cacheFinalityBlocks?: number;
     /**
+     * Opt-in TTL for reusing the mutable finality tail when the requested head
+     * has not changed. Defaults to 0 so general-purpose callers always refresh
+     * the tail unless they explicitly accept bounded staleness.
+     */
+    cacheMutableForMs?: number;
+    /**
      * Explicit legacy compatibility switch. Before reading events, lazily load
      * the historical Registry contract manifest once. Current/sampled/page
      * APIs intentionally leave this disabled.
      */
     loadHistoricalContractManifest?: boolean;
     onStats?: (stats: EventQueryStats) => void;
+    /** Called after every successfully decoded RPC chunk, including before a later abort. */
+    onChunk?: (chunk: EventQueryChunk) => void;
     dependencies?: EventReaderDependencies;
+}
+
+export interface EventQueryChunk {
+    fromBlock: number;
+    toBlock: number;
+    events: any[];
 }
 
 export interface EventRangeRequest {
@@ -246,6 +260,15 @@ function emitStats(options: EventQueryOptions, stats: EventQueryStats, now: () =
     }
 }
 
+function emitChunk(options: EventQueryOptions, fromBlock: number, toBlock: number, events: any[]): void {
+    if (!options.onChunk) return;
+    try {
+        options.onChunk({fromBlock, toBlock, events: events.slice()});
+    } catch (_) {
+        // A cache/observability hook must not make a valid RPC response fail.
+    }
+}
+
 function retryDelay(attempt: number, base: number, maximum: number, jitter: number, random: () => number): number {
     const exponential = Math.min(maximum, base * Math.pow(2, attempt));
     return Math.floor(exponential + random() * jitter);
@@ -322,11 +345,14 @@ export async function readEventRange(request: EventRangeRequest, options: EventQ
                     fromBlock: cursor,
                     toBlock: chunkEnd
                 });
-                assertNotAborted(options.signal);
                 if (!Array.isArray(queriedEvents)) throw new Error('RPC event response is not an array');
                 for (const event of queriedEvents) allEvents.push(event);
                 stats.receivedEvents += queriedEvents.length;
                 stats.completedChunks += 1;
+                // Persist a completed response before observing a concurrent
+                // abort so later range requests can reuse this exact chunk.
+                emitChunk(options, cursor, chunkEnd, queriedEvents);
+                assertNotAborted(options.signal);
                 consecutiveSuccesses += 1;
                 cursor = chunkEnd + 1;
                 if (consecutiveSuccesses >= growAfter && chunkSize < maxChunkSize) {

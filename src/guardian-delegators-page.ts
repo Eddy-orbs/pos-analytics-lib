@@ -9,6 +9,7 @@
 import BigNumber from 'bignumber.js';
 import {
     addressToTopic,
+    ascendingEvents,
     Contracts,
     getBlockEstimatedTime,
     getStartOfPosBlock,
@@ -17,7 +18,12 @@ import {
     Topics
 } from './eth-helpers';
 import {bigToNumber} from './helpers';
-import {EventQueryOptions} from './query/event-reader';
+import {deduplicateEvents, EventQueryOptions} from './query/event-reader';
+import {
+    fetchSubgraphGraphQl,
+    getSubgraphUrl,
+    normalizeSubgraphBaseUrl
+} from './subgraph/client';
 
 export interface GuardianDelegatorsPageDependencies {
     /** Primarily useful for alternate balance transports and deterministic tests. */
@@ -29,7 +35,8 @@ export interface GuardianDelegatorsPageDependencies {
         guardianAddress: string,
         chainId: number,
         targetBlock: number,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        subgraphBaseUrl?: string
     ) => Promise<GuardianDelegatorsSubgraphSnapshot>;
 }
 
@@ -56,6 +63,8 @@ export interface GuardianDelegatorsPageOptions {
     page_size?: number;
     /** Blocks excluded from the latest head. Defaults are chain-aware. */
     finality_blocks?: number;
+    /** Base URL of a service exposing the standard chain-specific Subgraph paths. */
+    subgraph_base_url?: string;
     signal?: AbortSignal;
     event_query_options?: EventQueryOptions;
     /**
@@ -64,6 +73,12 @@ export interface GuardianDelegatorsPageOptions {
      * getLogs calls on range-limited providers.
      */
     allow_full_rpc_fallback?: boolean;
+    /**
+     * A previously returned complete active-set snapshot. Supplying it lets a
+     * new Web3/browser session resume at `as_of_block + 1` instead of rebuilding
+     * the Guardian's full delegator set from the index.
+     */
+    cached_snapshot?: GuardianDelegatorsCacheSnapshot;
     dependencies?: GuardianDelegatorsPageDependencies;
 }
 
@@ -73,6 +88,30 @@ export interface GuardianDelegatorPageItem {
     non_stake: number;
     last_change_block: number;
     last_change_time: number;
+}
+
+export interface GuardianDelegatorsCacheSnapshotItem {
+    address: string;
+    stake: number;
+    last_change_block: number;
+    last_change_time: number;
+}
+
+/**
+ * Complete active-set state required to continue with a bounded RPC delta.
+ * Wallet balances are deliberately excluded because they are hydrated only
+ * for the requested page and always represent latest state.
+ */
+export interface GuardianDelegatorsCacheSnapshot {
+    guardian_address: string;
+    chain_id: number;
+    /** Subgraph service that produced the indexed baseline. */
+    subgraph_base_url?: string;
+    as_of_block: number;
+    finality_blocks: number;
+    cache_source: 'subgraph+rpc' | 'rpc-fallback';
+    subgraph_block?: number;
+    items: GuardianDelegatorsCacheSnapshotItem[];
 }
 
 export type GuardianDelegatorsPageCacheStatus =
@@ -109,6 +148,8 @@ export interface GuardianDelegatorsPage {
     cache_status: GuardianDelegatorsPageCacheStatus;
     cache_source: 'subgraph+rpc' | 'rpc-fallback';
     subgraph_block?: number;
+    /** Complete active-set baseline suitable for durable client persistence. */
+    cache_snapshot: GuardianDelegatorsCacheSnapshot;
     data_quality: GuardianDelegatorsPageDataQuality;
 }
 
@@ -161,17 +202,12 @@ const DEFAULT_FINALITY_BLOCKS: {[chainId: string]: number} = {
     1: 64,
     137: 256
 };
+const MAX_SUBGRAPH_RPC_TAIL_BLOCKS: {[chainId: string]: number} = {
+    1: 50000,
+    137: 10000
+};
 const SUBGRAPH_PAGE_SIZE = 100;
 const SUBGRAPH_EVENT_PAGE_SIZE = 1000;
-const SUBGRAPH_URLS: {[chainId: string]: string} = {
-    1: 'https://hub.orbs.network/delegationsSubgraphEth',
-    137: 'https://hub.orbs.network/delegationsSubgraphPolygon'
-};
-
-interface GraphQlResponse {
-    data?: any;
-    errors?: any[];
-}
 
 function abortError(): Error {
     const error = new Error('Guardian delegator page query aborted');
@@ -187,42 +223,266 @@ function isAbortError(error: any): boolean {
     return Boolean(error && error.name === 'AbortError');
 }
 
-async function fetchGraphQl(
-    url: string,
-    query: string,
-    variables: any,
-    signal?: AbortSignal
-): Promise<any> {
-    assertNotAborted(signal);
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({query, variables}),
-        signal
-    });
-    assertNotAborted(signal);
-    if (!response.ok) throw new Error(`Subgraph HTTP error ${response.status}`);
-    const payload: GraphQlResponse = await response.json();
-    assertNotAborted(signal);
-    if (payload.errors && payload.errors.length > 0) {
-        throw new Error(`Subgraph GraphQL error: ${JSON.stringify(payload.errors)}`);
-    }
-    if (!payload.data) throw new Error('Subgraph response is missing data');
-    return payload.data;
-}
-
 interface SubgraphDelegationEvent {
+    id?: string;
     addr?: string;
+    selfDelegatedStake?: string | number;
+    delegatedStake?: string | number;
     delegator?: string;
     delegatorContributedStake?: string | number;
     blockNumber?: string | number;
     blockTimestamp?: string | number;
+    transactionHash?: string;
+}
+
+export interface GuardianDelegationEventsSubgraphRange {
+    indexed_block: number;
+    has_indexing_errors: boolean;
+    events: any[];
 }
 
 /**
- * Polygon's legacy deployment has no materialized `Delegator` entity. Build
- * the same block-pinned active set from its indexed absolute stake events
- * instead of falling back to a full-chain RPC replay.
+ * Resolves a safe Guardian event-range seed from the index itself, avoiding
+ * timestamp-to-block binary searches against browser RPC. The preceding block
+ * preserves a synthetic chart point at the requested timestamp.
+ */
+export async function resolveGuardianDelegationEventStartBlockByTimestamp(
+    guardianAddress: string,
+    chainId: number,
+    fromTime: number,
+    signal?: AbortSignal,
+    subgraphBaseUrl?: string
+): Promise<number> {
+    const guardian = normalizeAddress(guardianAddress, 'guardianAddress');
+    const timestamp = normalizeNonNegativeInteger(fromTime, 'Subgraph event fromTime');
+    const normalizedBase = normalizeSubgraphBaseUrl(subgraphBaseUrl);
+    const url = getSubgraphUrl(chainId, normalizedBase);
+    const data = await fetchSubgraphGraphQl(url, `
+        query GuardianDelegationEventStart($guardian: Bytes!, $fromTime: BigInt!) {
+            _meta { block { number } hasIndexingErrors }
+            delegatedStakeChangeds(
+                first: 1,
+                orderBy: blockTimestamp,
+                orderDirection: asc,
+                where: {addr: $guardian, blockTimestamp_gte: $fromTime}
+            ) { blockNumber }
+        }
+    `, {guardian, fromTime: String(timestamp)}, signal);
+    const meta = data._meta;
+    const indexedHead = Number(meta && meta.block && meta.block.number);
+    if (!meta || meta.hasIndexingErrors !== false || !isFinite(indexedHead) || indexedHead < 0) {
+        throw new Error('Subgraph metadata is invalid or reports indexing errors');
+    }
+    const events = data.delegatedStakeChangeds;
+    if (!Array.isArray(events)) throw new Error('Subgraph delegation timestamp response is invalid');
+    if (events.length > 0) {
+        const firstEventBlock = normalizeNonNegativeInteger(
+            Number(events[0] && events[0].blockNumber),
+            'Subgraph event blockNumber'
+        );
+        return Math.max(0, firstEventBlock - 1);
+    }
+    const finalityBlocks = DEFAULT_FINALITY_BLOCKS[String(chainId)] || 0;
+    return Math.max(0, Math.floor(indexedHead) - finalityBlocks);
+}
+
+interface SubgraphEventCoverage {
+    fromBlock: number;
+    toBlock: number;
+}
+
+interface GuardianSubgraphEventCache {
+    coverage: SubgraphEventCoverage[];
+    events: any[];
+}
+
+const guardianSubgraphEventCaches: {[key: string]: GuardianSubgraphEventCache} = Object.create(null);
+
+function normalizeSubgraphEventCoverage(ranges: SubgraphEventCoverage[]): SubgraphEventCoverage[] {
+    const sorted = ranges.slice().sort((a, b) => a.fromBlock - b.fromBlock || a.toBlock - b.toBlock);
+    const result: SubgraphEventCoverage[] = [];
+    for (const range of sorted) {
+        const previous = result[result.length - 1];
+        if (!previous || range.fromBlock > previous.toBlock + 1) {
+            result.push({fromBlock: range.fromBlock, toBlock: range.toBlock});
+        } else {
+            previous.toBlock = Math.max(previous.toBlock, range.toBlock);
+        }
+    }
+    return result;
+}
+
+function missingSubgraphEventCoverage(
+    fromBlock: number,
+    toBlock: number,
+    coverage: SubgraphEventCoverage[]
+): SubgraphEventCoverage[] {
+    if (fromBlock > toBlock) return [];
+    const missing: SubgraphEventCoverage[] = [];
+    let cursor = fromBlock;
+    for (const range of normalizeSubgraphEventCoverage(coverage)) {
+        if (range.toBlock < cursor || range.fromBlock > toBlock) continue;
+        if (range.fromBlock > cursor) {
+            missing.push({fromBlock: cursor, toBlock: Math.min(toBlock, range.fromBlock - 1)});
+        }
+        cursor = Math.max(cursor, range.toBlock + 1);
+        if (cursor > toBlock) break;
+    }
+    if (cursor <= toBlock) missing.push({fromBlock: cursor, toBlock});
+    return missing;
+}
+
+function subgraphEventsWithin(events: any[], fromBlock: number, toBlock: number): any[] {
+    return events.filter(event => {
+        const blockNumber = Number(event && event.blockNumber);
+        return isFinite(blockNumber) && blockNumber >= fromBlock && blockNumber <= toBlock;
+    });
+}
+
+function subgraphEventLogIndex(event: SubgraphDelegationEvent): number {
+    const id = String(event && event.id || '').toLowerCase();
+    const transactionHash = String(event && event.transactionHash || '').toLowerCase();
+    const suffix = id.indexOf(transactionHash) === 0 ? id.slice(transactionHash.length) : '';
+    if (!/^[0-9a-f]{8}$/.test(suffix)) return 0;
+    const bytes = suffix.match(/.{2}/g) || [];
+    return parseInt(bytes.reverse().join(''), 16);
+}
+
+function rpcEventFromSubgraph(event: SubgraphDelegationEvent, guardianAddress: string): any {
+    const guardian = normalizeAddress(String(event && event.addr || ''), 'Subgraph event Guardian address');
+    const expectedGuardian = normalizeAddress(guardianAddress, 'guardianAddress');
+    const delegator = normalizeAddress(String(event && event.delegator || ''), 'Subgraph event Delegator address');
+    const blockNumber = Number(event && event.blockNumber);
+    const blockTimestamp = Number(event && event.blockTimestamp);
+    const transactionHash = String(event && event.transactionHash || '').toLowerCase();
+    const selfDelegatedStake = new BigNumber(event && event.selfDelegatedStake || 0);
+    const delegatedStake = new BigNumber(event && event.delegatedStake || 0);
+    const delegatorContributedStake = new BigNumber(event && event.delegatorContributedStake || 0);
+    if (
+        guardian !== expectedGuardian ||
+        !isFinite(blockNumber) || blockNumber < 0 ||
+        !isFinite(blockTimestamp) || blockTimestamp < 0 ||
+        !/^0x[0-9a-f]{64}$/.test(transactionHash) ||
+        !selfDelegatedStake.isFinite() || selfDelegatedStake.isNegative() ||
+        !delegatedStake.isFinite() || delegatedStake.isNegative() ||
+        !delegatorContributedStake.isFinite() || delegatorContributedStake.isNegative()
+    ) {
+        throw new Error('Subgraph delegation event contains invalid aggregate data');
+    }
+    return {
+        signature: Topics.DelegateStakeChanged,
+        blockNumber: Math.floor(blockNumber),
+        blockTimestamp: Math.floor(blockTimestamp),
+        transactionIndex: 0,
+        logIndex: subgraphEventLogIndex(event),
+        transactionHash,
+        returnValues: {
+            addr: guardian,
+            selfDelegatedStake: selfDelegatedStake.toFixed(0),
+            delegatedStake: delegatedStake.toFixed(0),
+            delegator,
+            delegatorContributedStake: delegatorContributedStake.toFixed(0)
+        }
+    };
+}
+
+/**
+ * Reads exact indexed Guardian aggregate events for a bounded block range.
+ * The latest chain-specific finality window is deliberately left for RPC
+ * `eth_getLogs`, so cached Subgraph pages represent immutable history.
+ */
+export async function readGuardianDelegationEventsSubgraphRange(
+    guardianAddress: string,
+    chainId: number,
+    fromBlock: number,
+    toBlock: number,
+    signal?: AbortSignal,
+    subgraphBaseUrl?: string
+): Promise<GuardianDelegationEventsSubgraphRange> {
+    const normalizedBase = normalizeSubgraphBaseUrl(subgraphBaseUrl);
+    const url = getSubgraphUrl(chainId, normalizedBase);
+    const normalizedFrom = normalizeNonNegativeInteger(fromBlock, 'Subgraph event fromBlock');
+    const normalizedTo = normalizeNonNegativeInteger(toBlock, 'Subgraph event toBlock');
+    if (normalizedFrom > normalizedTo) {
+        return {indexed_block: normalizedTo, has_indexing_errors: false, events: []};
+    }
+    const metaData = await fetchSubgraphGraphQl(url, `
+        query GuardianDelegationEventsMeta {
+            _meta { block { number } hasIndexingErrors }
+        }
+    `, {}, signal);
+    const meta = metaData._meta;
+    const indexedHead = Number(meta && meta.block && meta.block.number);
+    if (!meta || meta.hasIndexingErrors !== false || !isFinite(indexedHead) || indexedHead < 0) {
+        throw new Error('Subgraph metadata is invalid or reports indexing errors');
+    }
+    const finalityBlocks = DEFAULT_FINALITY_BLOCKS[String(chainId)] || 0;
+    const indexedBlock = Math.min(normalizedTo, Math.max(0, Math.floor(indexedHead) - finalityBlocks));
+    if (indexedBlock < normalizedFrom) {
+        return {indexed_block: indexedBlock, has_indexing_errors: false, events: []};
+    }
+
+    const cacheKey = `${normalizedBase}:${chainId}:${guardianAddress.toLowerCase()}`;
+    const cache = guardianSubgraphEventCaches[cacheKey] || {coverage: [], events: []};
+    guardianSubgraphEventCaches[cacheKey] = cache;
+    for (const range of missingSubgraphEventCoverage(normalizedFrom, indexedBlock, cache.coverage)) {
+        const rangeEvents: any[] = [];
+        let skip = 0;
+        while (true) {
+            const eventData = await fetchSubgraphGraphQl(url, `
+                query GuardianDelegationEventsRange(
+                    $guardian: Bytes!,
+                    $from: BigInt!,
+                    $to: BigInt!,
+                    $first: Int!,
+                    $skip: Int!
+                ) {
+                    delegatedStakeChangeds(
+                        first: $first,
+                        skip: $skip,
+                        orderBy: blockNumber,
+                        orderDirection: asc,
+                        where: {addr: $guardian, blockNumber_gte: $from, blockNumber_lte: $to}
+                    ) {
+                        id
+                        addr
+                        selfDelegatedStake
+                        delegatedStake
+                        delegator
+                        delegatorContributedStake
+                        blockNumber
+                        blockTimestamp
+                        transactionHash
+                    }
+                }
+            `, {
+                guardian: guardianAddress.toLowerCase(),
+                from: String(range.fromBlock),
+                to: String(range.toBlock),
+                first: SUBGRAPH_EVENT_PAGE_SIZE,
+                skip
+            }, signal);
+            const page = eventData.delegatedStakeChangeds;
+            if (!Array.isArray(page)) throw new Error('Subgraph delegation event range response is invalid');
+            for (const event of page) rangeEvents.push(rpcEventFromSubgraph(event, guardianAddress));
+            if (page.length < SUBGRAPH_EVENT_PAGE_SIZE) break;
+            skip += SUBGRAPH_EVENT_PAGE_SIZE;
+        }
+        for (const event of rangeEvents) cache.events.push(event);
+        cache.events = deduplicateEvents(cache.events, guardianAddress).events.sort(ascendingEvents);
+        cache.coverage = normalizeSubgraphEventCoverage(cache.coverage.concat(range));
+    }
+    return {
+        indexed_block: indexedBlock,
+        has_indexing_errors: false,
+        events: subgraphEventsWithin(cache.events, normalizedFrom, indexedBlock).sort(ascendingEvents)
+    };
+}
+
+/**
+ * Builds a block-pinned active set from indexed absolute stake events. This
+ * supports Polygon's legacy schema and Ethereum indexers that have pruned the
+ * historical entity state requested by a chart checkpoint.
  */
 export function guardianDelegatorItemsFromSubgraphEvents(
     guardianAddress: string,
@@ -265,15 +525,14 @@ async function readGuardianDelegatorsEventSnapshot(
     const events: SubgraphDelegationEvent[] = [];
     let skip = 0;
     while (true) {
-        const eventData = await fetchGraphQl(url, `
-            query GuardianDelegatorEvents($guardian: Bytes!, $block: Int!, $first: Int!, $skip: Int!) {
+        const eventData = await fetchSubgraphGraphQl(url, `
+            query GuardianDelegatorEvents($guardian: Bytes!, $block: BigInt!, $first: Int!, $skip: Int!) {
                 delegatedStakeChangeds(
                     first: $first,
                     skip: $skip,
                     orderBy: blockNumber,
                     orderDirection: asc,
-                    where: {addr: $guardian},
-                    block: {number: $block}
+                    where: {addr: $guardian, blockNumber_lte: $block}
                 ) {
                     addr
                     delegator
@@ -284,7 +543,7 @@ async function readGuardianDelegatorsEventSnapshot(
             }
         `, {
             guardian: guardianAddress,
-            block: snapshotBlock,
+            block: String(snapshotBlock),
             first: SUBGRAPH_EVENT_PAGE_SIZE,
             skip
         }, signal);
@@ -302,11 +561,11 @@ export async function readGuardianDelegatorsSubgraphSnapshot(
     guardianAddress: string,
     chainId: number,
     targetBlock: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    subgraphBaseUrl?: string
 ): Promise<GuardianDelegatorsSubgraphSnapshot> {
-    const url = SUBGRAPH_URLS[String(chainId)];
-    if (!url) throw new Error(`Unsupported Subgraph chain id ${chainId}`);
-    const metaData = await fetchGraphQl(url, `
+    const url = getSubgraphUrl(chainId, subgraphBaseUrl);
+    const metaData = await fetchSubgraphGraphQl(url, `
         query GuardianDelegatorsMeta {
             _meta { block { number } hasIndexingErrors }
         }
@@ -332,80 +591,94 @@ export async function readGuardianDelegatorsSubgraphSnapshot(
         };
     }
 
-    const mappingIds: string[] = [];
-    const seenMappings: {[address: string]: boolean} = Object.create(null);
-    let skip = 0;
-    while (true) {
-        const mappingData = await fetchGraphQl(url, `
-            query GuardianDelegatorMappings($guardian: String!, $block: Int!, $first: Int!, $skip: Int!) {
-                delegatorToGuardians(
-                    first: $first,
-                    skip: $skip,
-                    orderBy: id,
-                    orderDirection: asc,
-                    where: {guardian: $guardian},
-                    block: {number: $block}
-                ) { id guardian }
-            }
-        `, {
-            guardian: guardianAddress,
-            block: snapshotBlock,
-            first: SUBGRAPH_PAGE_SIZE,
-            skip
-        }, signal);
-        const mappings = mappingData.delegatorToGuardians;
-        if (!Array.isArray(mappings)) throw new Error('Subgraph mapping response is invalid');
-        for (const mapping of mappings) {
-            const id = mapping && typeof mapping.id === 'string' ? mapping.id.toLowerCase() : '';
-            const guardian = mapping && typeof mapping.guardian === 'string' ? mapping.guardian.toLowerCase() : '';
-            if (!id || guardian !== guardianAddress) throw new Error('Subgraph mapping contains invalid data');
-            if (!seenMappings[id]) {
-                seenMappings[id] = true;
-                mappingIds.push(id);
-            }
-        }
-        if (mappings.length < SUBGRAPH_PAGE_SIZE) break;
-        skip += SUBGRAPH_PAGE_SIZE;
-    }
-
-    const items: GuardianDelegatorsSubgraphItem[] = [];
-    const returnedIds: {[address: string]: boolean} = Object.create(null);
-    for (let start = 0; start < mappingIds.length; start += SUBGRAPH_PAGE_SIZE) {
-        const ids = mappingIds.slice(start, start + SUBGRAPH_PAGE_SIZE);
-        const entityData = await fetchGraphQl(url, `
-            query GuardianDelegatorEntities($ids: [ID!]!, $block: Int!) {
-                delegators(first: 100, where: {id_in: $ids}, block: {number: $block}) {
-                    id address stake nonStake lastChangeBlock lastChangeTime
+    try {
+        const mappingIds: string[] = [];
+        const seenMappings: {[address: string]: boolean} = Object.create(null);
+        let skip = 0;
+        while (true) {
+            const mappingData = await fetchSubgraphGraphQl(url, `
+                query GuardianDelegatorMappings($guardian: String!, $block: Int!, $first: Int!, $skip: Int!) {
+                    delegatorToGuardians(
+                        first: $first,
+                        skip: $skip,
+                        orderBy: id,
+                        orderDirection: asc,
+                        where: {guardian: $guardian},
+                        block: {number: $block}
+                    ) { id guardian }
+                }
+            `, {
+                guardian: guardianAddress,
+                block: snapshotBlock,
+                first: SUBGRAPH_PAGE_SIZE,
+                skip
+            }, signal);
+            const mappings = mappingData.delegatorToGuardians;
+            if (!Array.isArray(mappings)) throw new Error('Subgraph mapping response is invalid');
+            for (const mapping of mappings) {
+                const id = mapping && typeof mapping.id === 'string' ? mapping.id.toLowerCase() : '';
+                const guardian = mapping && typeof mapping.guardian === 'string' ? mapping.guardian.toLowerCase() : '';
+                if (!id || guardian !== guardianAddress) throw new Error('Subgraph mapping contains invalid data');
+                if (!seenMappings[id]) {
+                    seenMappings[id] = true;
+                    mappingIds.push(id);
                 }
             }
-        `, {ids, block: snapshotBlock}, signal);
-        const entities = entityData.delegators;
-        if (!Array.isArray(entities)) throw new Error('Subgraph delegator response is invalid');
-        for (const entity of entities) {
-            const id = entity && typeof entity.id === 'string' ? entity.id.toLowerCase() : '';
-            const address = entity && typeof entity.address === 'string' ? entity.address.toLowerCase() : '';
-            if (!id || !address || !seenMappings[id] || returnedIds[id]) {
-                throw new Error('Subgraph delegator entity contains invalid data');
-            }
-            returnedIds[id] = true;
-            items.push({
-                address,
-                stake: entity.stake,
-                non_stake: entity.nonStake,
-                last_change_block: entity.lastChangeBlock,
-                last_change_time: entity.lastChangeTime
-            });
+            if (mappings.length < SUBGRAPH_PAGE_SIZE) break;
+            skip += SUBGRAPH_PAGE_SIZE;
         }
-    }
-    // A mapping can exist before the first stake-changing event creates its
-    // Delegator entity. Such an address has no indexed active stake and is
-    // intentionally equivalent to a zero-stake row.
 
-    return {
-        block_number: snapshotBlock,
-        has_indexing_errors: false,
-        items
-    };
+        const items: GuardianDelegatorsSubgraphItem[] = [];
+        const returnedIds: {[address: string]: boolean} = Object.create(null);
+        for (let start = 0; start < mappingIds.length; start += SUBGRAPH_PAGE_SIZE) {
+            const ids = mappingIds.slice(start, start + SUBGRAPH_PAGE_SIZE);
+            const entityData = await fetchSubgraphGraphQl(url, `
+                query GuardianDelegatorEntities($ids: [ID!]!, $block: Int!) {
+                    delegators(first: 100, where: {id_in: $ids}, block: {number: $block}) {
+                        id address stake nonStake lastChangeBlock lastChangeTime
+                    }
+                }
+            `, {ids, block: snapshotBlock}, signal);
+            const entities = entityData.delegators;
+            if (!Array.isArray(entities)) throw new Error('Subgraph delegator response is invalid');
+            for (const entity of entities) {
+                const id = entity && typeof entity.id === 'string' ? entity.id.toLowerCase() : '';
+                const address = entity && typeof entity.address === 'string' ? entity.address.toLowerCase() : '';
+                if (!id || !address || !seenMappings[id] || returnedIds[id]) {
+                    throw new Error('Subgraph delegator entity contains invalid data');
+                }
+                returnedIds[id] = true;
+                items.push({
+                    address,
+                    stake: entity.stake,
+                    non_stake: entity.nonStake,
+                    last_change_block: entity.lastChangeBlock,
+                    last_change_time: entity.lastChangeTime
+                });
+            }
+        }
+        // A mapping can exist before the first stake-changing event creates its
+        // Delegator entity. Such an address has no indexed active stake and is
+        // intentionally equivalent to a zero-stake row.
+
+        return {
+            block_number: snapshotBlock,
+            has_indexing_errors: false,
+            items
+        };
+    } catch (error) {
+        if (isAbortError(error) || (signal && signal.aborted)) throw error;
+        return {
+            block_number: snapshotBlock,
+            has_indexing_errors: false,
+            items: await readGuardianDelegatorsEventSnapshot(
+                url,
+                guardianAddress,
+                snapshotBlock,
+                signal
+            )
+        };
+    }
 }
 
 function normalizeNonNegativeInteger(value: number, name: string): number {
@@ -436,14 +709,15 @@ function cacheFor(web3: any): Web3Cache {
     return cache;
 }
 
-function entryFor(cache: Web3Cache, guardianAddress: string): GuardianCacheEntry {
-    let entry = cache.guardians[guardianAddress];
+function entryFor(cache: Web3Cache, guardianAddress: string, subgraphBaseUrl?: string): GuardianCacheEntry {
+    const key = `${normalizeSubgraphBaseUrl(subgraphBaseUrl)}:${guardianAddress}`;
+    let entry = cache.guardians[key];
     if (!entry) {
         entry = {
             snapshots: [],
             queue: Promise.resolve()
         };
-        cache.guardians[guardianAddress] = entry;
+        cache.guardians[key] = entry;
     }
     return entry;
 }
@@ -460,6 +734,73 @@ function copyDelegators(source: {[address: string]: CachedDelegator}): {[address
         };
     }
     return result;
+}
+
+function snapshotFromDurableCache(
+    cached: GuardianDelegatorsCacheSnapshot,
+    guardianAddress: string,
+    chainId: number,
+    minimumBlock: number,
+    targetBlock: number,
+    subgraphBaseUrl?: string
+): DelegatorSnapshot | undefined {
+    if (!cached || typeof cached !== 'object') throw new Error('Guardian delegator cached snapshot is invalid');
+    if (normalizeAddress(cached.guardian_address, 'cached snapshot guardian_address') !== guardianAddress) {
+        throw new Error('Guardian delegator cached snapshot belongs to another guardian');
+    }
+    if (normalizeNonNegativeInteger(cached.chain_id, 'cached snapshot chain_id') !== chainId) {
+        throw new Error('Guardian delegator cached snapshot belongs to another chain');
+    }
+    const expectedSubgraphBase = normalizeSubgraphBaseUrl(subgraphBaseUrl);
+    const cachedSubgraphBase = normalizeSubgraphBaseUrl(cached.subgraph_base_url);
+    if (cachedSubgraphBase !== expectedSubgraphBase) return undefined;
+    const asOfBlock = normalizeNonNegativeInteger(cached.as_of_block, 'cached snapshot as_of_block');
+    if (asOfBlock < minimumBlock) throw new Error('Guardian delegator cached snapshot predates PoS');
+    // An RPC endpoint can temporarily report a head behind the persisted
+    // boundary. Ignore that future baseline and rebuild from an authoritative
+    // source rather than applying a negative or ambiguous delta.
+    if (asOfBlock > targetBlock) return undefined;
+    const finalityBlocks = normalizeNonNegativeInteger(
+        cached.finality_blocks,
+        'cached snapshot finality_blocks'
+    );
+    if (cached.cache_source !== 'subgraph+rpc' && cached.cache_source !== 'rpc-fallback') {
+        throw new Error('Guardian delegator cached snapshot source is invalid');
+    }
+    let subgraphBlock: number | undefined;
+    if (cached.subgraph_block !== undefined) {
+        subgraphBlock = normalizeNonNegativeInteger(cached.subgraph_block, 'cached snapshot subgraph_block');
+        if (subgraphBlock > asOfBlock) throw new Error('Guardian delegator cached snapshot Subgraph block is invalid');
+    }
+    if (!Array.isArray(cached.items)) throw new Error('Guardian delegator cached snapshot items are invalid');
+
+    const delegators: {[address: string]: CachedDelegator} = Object.create(null);
+    for (const item of cached.items) {
+        if (!item || typeof item !== 'object') throw new Error('Guardian delegator cached snapshot item is invalid');
+        const address = normalizeAddress(item.address, 'cached snapshot delegator address');
+        if (address === guardianAddress) throw new Error('Guardian cannot appear in its delegator cached snapshot');
+        if (delegators[address]) throw new Error(`Guardian delegator cached snapshot contains duplicate ${address}`);
+        const stake = Number(item.stake);
+        const lastChangeBlock = normalizeNonNegativeInteger(
+            item.last_change_block,
+            'cached snapshot last_change_block'
+        );
+        const lastChangeTime = normalizeNonNegativeInteger(
+            item.last_change_time,
+            'cached snapshot last_change_time'
+        );
+        if (!isFinite(stake) || stake <= 0 || lastChangeBlock > asOfBlock) {
+            throw new Error(`Guardian delegator cached snapshot contains invalid data for ${address}`);
+        }
+        delegators[address] = {address, stake, lastChangeBlock, lastChangeTime};
+    }
+    return {
+        asOfBlock,
+        finalityBlocks,
+        source: cached.cache_source,
+        subgraphBlock,
+        delegators
+    };
 }
 
 function eventOrder(left: any, right: any): number {
@@ -629,6 +970,25 @@ function delegatorsFromSubgraph(
     return result;
 }
 
+function exceedsSafeSubgraphRpcTail(chainId: number, fromBlock: number, toBlock: number): boolean {
+    if (fromBlock > toBlock) return false;
+    const maximum = MAX_SUBGRAPH_RPC_TAIL_BLOCKS[String(chainId)];
+    if (maximum === undefined) throw new Error(`Unsupported Subgraph chain id ${chainId}`);
+    return toBlock - fromBlock + 1 > maximum;
+}
+
+function assertSafeSubgraphRpcTail(
+    chainId: number,
+    fromBlock: number,
+    toBlock: number,
+    allowFullRpcFallback?: boolean
+): void {
+    if (allowFullRpcFallback || !exceedsSafeSubgraphRpcTail(chainId, fromBlock, toBlock)) return;
+    throw new Error(
+        `Guardian delegator Subgraph is ${toBlock - fromBlock + 1} blocks behind; refusing an unbounded RPC delta`
+    );
+}
+
 async function buildSnapshot(
     guardianAddress: string,
     web3: any,
@@ -646,7 +1006,16 @@ async function buildSnapshot(
 
     const posStart = getStartOfPosBlock(chainId);
     if (!posStart) throw new Error(`Unsupported chain id ${chainId}`);
-    const base = newestSnapshotAtOrBefore(entry, targetBlock);
+    let base = newestSnapshotAtOrBefore(entry, targetBlock);
+    if (
+        base &&
+        !options.allow_full_rpc_fallback &&
+        exceedsSafeSubgraphRpcTail(chainId, base.asOfBlock + 1, targetBlock)
+    ) {
+        // A long-lived browser/durable cache must not turn into a full-chain
+        // RPC replay. Re-seed from the configured index at the new head.
+        base = undefined;
+    }
     let delegators: {[address: string]: CachedDelegator};
     let fromBlock: number;
     let source: 'subgraph+rpc' | 'rpc-fallback';
@@ -661,11 +1030,23 @@ async function buildSnapshot(
             ? options.dependencies.readSubgraphSnapshot
             : readGuardianDelegatorsSubgraphSnapshot;
         try {
-            const seed = await subgraphReader(guardianAddress, chainId, targetBlock, options.signal);
+            const seed = await subgraphReader(
+                guardianAddress,
+                chainId,
+                targetBlock,
+                options.signal,
+                options.subgraph_base_url
+            );
             delegators = delegatorsFromSubgraph(guardianAddress, targetBlock, seed);
             subgraphBlock = Math.floor(Number(seed.block_number));
             fromBlock = subgraphBlock + 1;
             source = 'subgraph+rpc';
+            assertSafeSubgraphRpcTail(
+                chainId,
+                fromBlock,
+                targetBlock,
+                options.allow_full_rpc_fallback
+            );
         } catch (error) {
             if (isAbortError(error) || (options.signal && options.signal.aborted)) throw error;
             if (!options.allow_full_rpc_fallback) {
@@ -736,6 +1117,34 @@ function sortedActiveDelegators(snapshot: DelegatorSnapshot): CachedDelegator[] 
         });
 }
 
+function durableCacheSnapshot(
+    guardianAddress: string,
+    chainId: number,
+    snapshot: DelegatorSnapshot,
+    subgraphBaseUrl?: string
+): GuardianDelegatorsCacheSnapshot {
+    return {
+        guardian_address: guardianAddress,
+        chain_id: chainId,
+        subgraph_base_url: normalizeSubgraphBaseUrl(subgraphBaseUrl),
+        as_of_block: snapshot.asOfBlock,
+        finality_blocks: snapshot.finalityBlocks,
+        cache_source: snapshot.source,
+        subgraph_block: snapshot.subgraphBlock,
+        items: Object.keys(snapshot.delegators)
+            .sort()
+            .map(address => {
+                const item = snapshot.delegators[address];
+                return {
+                    address: item.address,
+                    stake: item.stake,
+                    last_change_block: item.lastChangeBlock,
+                    last_change_time: item.lastChangeTime
+                };
+            })
+    };
+}
+
 /**
  * Returns one deterministic page of active delegators for a Guardian.
  *
@@ -791,7 +1200,18 @@ export async function getGuardianDelegatorsPage(
         offset = 0;
     }
 
-    const entry = entryFor(cache, guardian);
+    const entry = entryFor(cache, guardian, options.subgraph_base_url);
+    if (options.cached_snapshot) {
+        const restored = snapshotFromDurableCache(
+            options.cached_snapshot,
+            guardian,
+            chainId,
+            posStart.number - 1,
+            targetBlock,
+            options.subgraph_base_url
+        );
+        if (restored && !findSnapshot(entry, restored.asOfBlock)) retainSnapshot(entry, restored);
+    }
     const snapshotResult = await queuedSnapshot(
         guardian,
         web3,
@@ -840,6 +1260,12 @@ export async function getGuardianDelegatorsPage(
         cache_status: snapshotResult.cacheStatus,
         cache_source: snapshotResult.snapshot.source,
         subgraph_block: snapshotResult.snapshot.subgraphBlock,
+        cache_snapshot: durableCacheSnapshot(
+            guardian,
+            chainId,
+            snapshotResult.snapshot,
+            options.subgraph_base_url
+        ),
         data_quality: {
             active_set_exact: true,
             stake_values_exact: true,

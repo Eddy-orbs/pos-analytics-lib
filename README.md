@@ -119,6 +119,8 @@ New applications should compose detail screens from the smaller APIs below inste
 * `getGuardianDelegatorsPage(address, web3, {page_size, cursor})` loads the delegator list only when requested.
   It seeds from a block-pinned Subgraph snapshot, replays only the short RPC delta, and hydrates balances only for
   the returned page. Ethereum uses materialized entities; Polygon adapts its legacy absolute-event schema.
+  Persist `cache_snapshot` from a response and pass it back as `cached_snapshot` after a reload to resume from
+  `as_of_block + 1`; cursor pages can also be restored on a newly created Web3 instance without a full rebuild.
   A full-chain RPC fallback is disabled unless `allow_full_rpc_fallback: true` is explicitly supplied.
 
 Web3 initialization resolves current contracts through bounded registry `eth_call` hops and performs no registry
