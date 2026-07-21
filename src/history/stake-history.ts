@@ -308,15 +308,18 @@ function supportedDelegatorEvent(event: any): boolean {
 
 function reverseDelegatorEvent(stake: BigNumber, cooldown: BigNumber, event: any): {stake: BigNumber; cooldown: BigNumber} {
     const amount = eventAmount(event);
+    const exactPostEventStake = event.returnValues.totalStakedAmount !== undefined
+        ? new BigNumber(event.returnValues.totalStakedAmount)
+        : stake;
     switch (event.signature) {
         case Topics.Staked:
-            return {stake: stake.minus(amount), cooldown};
+            return {stake: exactPostEventStake.minus(amount), cooldown};
         case Topics.Restaked:
-            return {stake: stake.minus(amount), cooldown: cooldown.plus(amount)};
+            return {stake: exactPostEventStake.minus(amount), cooldown: cooldown.plus(amount)};
         case Topics.Unstaked:
-            return {stake: stake.plus(amount), cooldown: cooldown.minus(amount)};
+            return {stake: exactPostEventStake.plus(amount), cooldown: cooldown.minus(amount)};
         case Topics.Withdrew:
-            return {stake, cooldown: cooldown.plus(amount)};
+            return {stake: exactPostEventStake, cooldown: cooldown.plus(amount)};
         default:
             return {stake, cooldown};
     }
@@ -356,6 +359,21 @@ function applyDelegatorEvent(stake: BigNumber, cooldown: BigNumber, event: any):
 function assertNonNegativeState(stake: BigNumber, cooldown: BigNumber): void {
     if (stake.isNegative() || cooldown.isNegative()) {
         throw new Error('Stake event history is inconsistent with the current contract state');
+    }
+}
+
+function assertCurrentStakeMatchesLatestEvent(currentStake: BigNumber, events: any[]): void {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+        const value = events[index] && events[index].returnValues && events[index].returnValues.totalStakedAmount;
+        if (value === undefined) continue;
+        const exactPostEventStake = new BigNumber(value);
+        const tolerance = BigNumber.maximum(currentStake.abs(), exactPostEventStake.abs())
+            .multipliedBy('0.000000000001')
+            .plus(1);
+        if (currentStake.minus(exactPostEventStake).abs().isGreaterThan(tolerance)) {
+            throw new Error('Stake event history is inconsistent with the current contract state');
+        }
+        return;
     }
 }
 
@@ -414,6 +432,7 @@ export function buildDelegatorStakeSlices(
     rangeStart?: CurrentBlock
 ): DelegatorStake[] {
     const events = eventsInput.filter(supportedDelegatorEvent).slice().sort(ascendingEvents);
+    assertCurrentStakeMatchesLatestEvent(currentStake, events);
     let anchorStake = new BigNumber(currentStake);
     let anchorCooldown = new BigNumber(currentCooldown);
     for (let index = events.length - 1; index >= 0; index -= 1) {

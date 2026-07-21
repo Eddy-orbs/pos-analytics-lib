@@ -98,6 +98,53 @@ async function testSameBlockPreservesEveryDelegatorEvent(): Promise<void> {
     ]);
 }
 
+async function testDelegatorExactEventTotalsOverrideRoundedCurrentSnapshot(): Promise<void> {
+    const exactEvents = [
+        {
+            signature: Topics.Staked,
+            blockNumber: 110,
+            transactionIndex: 0,
+            logIndex: 0,
+            returnValues: {
+                amount: '434949880000000000000000',
+                totalStakedAmount: '434949880000000000000000'
+            }
+        },
+        {
+            signature: Topics.Staked,
+            blockNumber: 120,
+            transactionIndex: 0,
+            logIndex: 0,
+            returnValues: {
+                amount: '1878061624528026833300',
+                totalStakedAmount: '436827941624528026833300'
+            }
+        },
+        {
+            signature: Topics.Staked,
+            blockNumber: 130,
+            transactionIndex: 0,
+            logIndex: 0,
+            returnValues: {
+                amount: '9059016835657845202199',
+                totalStakedAmount: '445886958460185872035499'
+            }
+        }
+    ];
+    const roundedCurrentStake = new BigNumber(445886.95846018585).multipliedBy('1000000000000000000');
+    const slices = buildDelegatorStakeSlices(
+        100,
+        {number: 140, time: 1400},
+        roundedCurrentStake,
+        new BigNumber(0),
+        exactEvents,
+        1
+    );
+
+    assert.strictEqual(slices[0].stake, 0);
+    assert.strictEqual(slices[slices.length - 1].stake, 445886.95846018585);
+}
+
 async function testEmptyDelegatorWindowIsFlatAndQueriesOnlyStakeEvents(): Promise<void> {
     const eventContracts: Contracts[] = [];
     const eventFilters: any[] = [];
@@ -887,6 +934,7 @@ async function testSampledStateHasBoundedRateLimitRetry(): Promise<void> {
 async function run(): Promise<void> {
     await testDelegatorPreWindowAnchor();
     await testSameBlockPreservesEveryDelegatorEvent();
+    await testDelegatorExactEventTotalsOverrideRoundedCurrentSnapshot();
     await testEmptyDelegatorWindowIsFlatAndQueriesOnlyStakeEvents();
     await testDelegatorEventHistoryReusesCurrentSnapshot();
     await testDelegatorUsesIndexedHistoryAndOnlyRpcHeadDelta();
